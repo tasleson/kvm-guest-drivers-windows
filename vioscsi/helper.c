@@ -108,6 +108,19 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         }
     }
 
+    // WHY NT_VERIFY + bugcheck: QueueNumber %= adaptExt->num_queues above drops the
+    // VIRTIO_SCSI_REQUEST_QUEUE_0 offset instead of preserving it (should be
+    // VIRTIO_SCSI_REQUEST_QUEUE_0 + ((QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0) %
+    // num_queues)), so whenever the wrap branch is taken, QueueNumber lands below
+    // VIRTIO_SCSI_REQUEST_QUEUE_0. That underflows vq_req_idx below into a huge index into
+    // processing_srbs[], and adaptExt->vq[QueueNumber] can resolve to the control queue's
+    // virtqueue, posting a SCSI command on the TMF control queue. Known bug, not yet fixed -
+    // this proves when it's actually hit rather than letting it corrupt memory silently.
+    if (!NT_VERIFY(QueueNumber >= VIRTIO_SCSI_REQUEST_QUEUE_0))
+    {
+        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, QueueNumber, adaptExt->num_queues, 0);
+    }
+
     srbExt = SRB_EXTENSION(Srb);
 
     if (!srbExt)
@@ -228,7 +241,19 @@ DeviceReset(IN PVOID DeviceExtension)
     {
         return TRUE;
     }
-    ASSERT(adaptExt->tmf_infly == FALSE);
+    // WHY NT_VERIFY + bugcheck: adaptExt->tmf_cmd/srbExt is a single shared per-adapter
+    // structure, not per-request. If a second TMF were built here while one is already in
+    // flight, this would overwrite the in-flight command's SRB/SG state out from under it,
+    // so when it eventually completes, the driver would act on the wrong request's data.
+    // DeviceReset should be unreachable while a prior TMF is in flight under correct
+    // operation (Storport serializes reset handling) - hitting this means our own
+    // concurrency assumptions already broke down, so a quiet "return FALSE" would let the
+    // driver keep running on top of an already-violated invariant. Deliberately fatal while
+    // this driver is under hypervisor error injection to find where it corrupts memory today.
+    if (!NT_VERIFY(adaptExt->tmf_infly == FALSE))
+    {
+        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, (ULONG_PTR)adaptExt, adaptExt->tmf_infly, 0);
+    }
     Srb->SrbExtension = srbExt;
     RtlZeroMemory((PVOID)cmd, sizeof(VirtIOSCSICmd));
     cmd->srb = (PVOID)Srb;
@@ -563,11 +588,35 @@ VOID VioScsiVQLock(IN PVOID DeviceExtension, IN ULONG MessageID, IN OUT PSTOR_LO
     {
         if (adaptExt->msix_enabled)
         {
-            // Queue numbers start at 0, message ids at 1.
-            NT_ASSERT(MessageID > VIRTIO_SCSI_REQUEST_QUEUE_0);
+            // WHY NT_VERIFY + bugcheck: Queue numbers start at 0, message ids at 1 (comment
+            // above), so QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0 below indexes
+            // adaptExt->dpc[]. If MessageID were <= VIRTIO_SCSI_REQUEST_QUEUE_0, that unsigned
+            // subtraction underflows into a huge index, handing StorPortAcquireSpinLock a wild
+            // pointer instead of a real per-queue DPC lock. This should be unreachable under
+            // correct operation, so a violation means something is already broken -
+            // deliberately fatal rather than silently falling back to a different lock, while
+            // this driver is under hypervisor error injection to find where it corrupts memory
+            // today.
+            if (!NT_VERIFY(MessageID > VIRTIO_SCSI_REQUEST_QUEUE_0))
+            {
+                KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
+                            __LINE__,
+                            MessageID,
+                            VIRTIO_SCSI_REQUEST_QUEUE_0,
+                            0);
+            }
             if (QueueNumber >= (adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0))
             {
                 QueueNumber %= adaptExt->num_queues;
+            }
+            // WHY NT_VERIFY + bugcheck: the %= above drops the VIRTIO_SCSI_REQUEST_QUEUE_0
+            // offset instead of preserving it, so whenever the wrap branch is taken,
+            // QueueNumber lands below VIRTIO_SCSI_REQUEST_QUEUE_0 and the dpc[] index below
+            // underflows into a huge value. Known bug, not yet fixed - this proves when it's
+            // actually hit rather than handing StorPortAcquireSpinLock a wild pointer.
+            if (!NT_VERIFY(QueueNumber >= VIRTIO_SCSI_REQUEST_QUEUE_0))
+            {
+                KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, QueueNumber, adaptExt->num_queues, 0);
             }
             StorPortAcquireSpinLock(DeviceExtension,
                                     DpcLock,
@@ -619,6 +668,21 @@ VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         case FIRMWARE_FUNCTION_GET_INFO:
             {
                 PSTORAGE_FIRMWARE_INFO_V2 firmwareInfo;
+                // WHY NT_VERIFY + bugcheck: DataBufferOffset is caller-supplied (via the
+                // firmware IOCTL payload) and used below to form a pointer into the SRB data
+                // buffer with no proof that DataBufferOffset + sizeof(STORAGE_FIRMWARE_INFO_V2)
+                // actually fits inside dataLen. A malformed/malicious offset causes an
+                // out-of-bounds kernel read/write at an attacker-chosen offset. Known bug, not
+                // yet fixed - this proves when it's actually hit rather than corrupting
+                // memory silently.
+                if (!NT_VERIFY((ULONGLONG)firmwareRequest->DataBufferOffset + sizeof(STORAGE_FIRMWARE_INFO_V2) <= dataLen))
+                {
+                    KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
+                                __LINE__,
+                                firmwareRequest->DataBufferOffset,
+                                dataLen,
+                                (ULONG_PTR)Srb);
+                }
                 firmwareInfo = (PSTORAGE_FIRMWARE_INFO_V2)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
                 RhelDbgPrint(TRACE_LEVEL_INFORMATION, " FIRMWARE_FUNCTION_GET_INFO \n");
                 if ((firmwareInfo->Version >= STORAGE_FIRMWARE_INFO_STRUCTURE_VERSION_V2) ||
@@ -668,6 +732,16 @@ VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         case FIRMWARE_FUNCTION_DOWNLOAD:
             {
                 PSTORAGE_FIRMWARE_DOWNLOAD_V2 firmwareDwnld;
+                // WHY NT_VERIFY + bugcheck: see FIRMWARE_FUNCTION_GET_INFO above - same
+                // unchecked caller-supplied offset, same out-of-bounds risk.
+                if (!NT_VERIFY((ULONGLONG)firmwareRequest->DataBufferOffset + sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2) <= dataLen))
+                {
+                    KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
+                                __LINE__,
+                                firmwareRequest->DataBufferOffset,
+                                dataLen,
+                                (ULONG_PTR)Srb);
+                }
                 firmwareDwnld = (PSTORAGE_FIRMWARE_DOWNLOAD_V2)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
                 RhelDbgPrint(TRACE_LEVEL_INFORMATION, " FIRMWARE_FUNCTION_DOWNLOAD \n");
                 if ((firmwareDwnld->Version >= STORAGE_FIRMWARE_DOWNLOAD_STRUCTURE_VERSION_V2) ||
@@ -693,6 +767,16 @@ VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         case FIRMWARE_FUNCTION_ACTIVATE:
             {
                 PSTORAGE_FIRMWARE_ACTIVATE firmwareActivate;
+                // WHY NT_VERIFY + bugcheck: see FIRMWARE_FUNCTION_GET_INFO above - same
+                // unchecked caller-supplied offset, same out-of-bounds risk.
+                if (!NT_VERIFY((ULONGLONG)firmwareRequest->DataBufferOffset + sizeof(STORAGE_FIRMWARE_ACTIVATE) <= dataLen))
+                {
+                    KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
+                                __LINE__,
+                                firmwareRequest->DataBufferOffset,
+                                dataLen,
+                                (ULONG_PTR)Srb);
+                }
                 firmwareActivate = (PSTORAGE_FIRMWARE_ACTIVATE)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
                 if ((firmwareActivate->Version == STORAGE_FIRMWARE_ACTIVATE_STRUCTURE_VERSION) ||
                     (firmwareActivate->Size >= sizeof(STORAGE_FIRMWARE_ACTIVATE)))

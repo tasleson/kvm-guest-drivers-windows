@@ -279,6 +279,16 @@ typedef struct _REQUEST_LIST
     ULONG_PTR next_id;
 } REQUEST_LIST, *PREQUEST_LIST;
 
+//
+// Bugcheck code for the NT_VERIFY corruption guards below. These are deliberately
+// fatal rather than recovered from: this driver is currently being run under
+// hypervisor-driven error injection to find where it silently corrupts memory
+// today, so any such invariant violation should stop the VM immediately and
+// visibly rather than being quietly routed around. Distinct from 0xDEADDEAD,
+// which is the pre-existing manually-triggered test path (VioscsiResetBugCheck).
+//
+#define VIOSCSI_BUGCHECK_CORRUPTION_GUARD 0xBAADC0DE
+
 typedef struct virtio_bar
 {
     PHYSICAL_ADDRESS BasePA;

@@ -471,6 +471,21 @@ VioScsiFindAdapter(IN PVOID DeviceExtension,
         }
     }
 
+    // WHY NT_VERIFY: adaptExt->num_queues is used below (via InitializeVirtualQueues) to
+    // write that many virtqueue pointers into the fixed-size adaptExt->vq[] array, and
+    // drives indexing into the fixed-size adaptExt->processing_srbs[] array on every I/O -
+    // both sized exactly MAX_CPU. adaptExt->scsi_config.num_queues comes from the device
+    // config space (host/hypervisor-controlled), and the clamps above only bound it against
+    // the host's CPU count, never against MAX_CPU itself. A host reporting more queues than
+    // MAX_CPU on a large (>256 logical CPU) VM would overflow both arrays on every
+    // subsequent I/O. Must be checked in release builds, not just asserted, since the input
+    // is hardware-controlled.
+    if (!NT_VERIFY(adaptExt->num_queues <= MAX_CPU))
+    {
+        RhelDbgPrint(TRACE_LEVEL_WARNING, " Device reported %d queues, clamping to MAX_CPU (%d).", adaptExt->num_queues, MAX_CPU);
+        adaptExt->num_queues = MAX_CPU;
+    }
+
     /* This function is our only chance to allocate memory for the driver; allocations are not
      * possible later on. Even worse, the only allocation mechanism guaranteed to work in all
      * cases is StorPortGetUncachedExtension, which gives us one block of physically contiguous
@@ -665,7 +680,24 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Queues %d msix_vectors %d\n", adaptExt->num_queues, adaptExt->msix_vectors);
     if (adaptExt->num_queues > 1 && ((adaptExt->num_queues + 3) > adaptExt->msix_vectors))
     {
+        ULONG preMsiNumQueues = adaptExt->num_queues;
+
         adaptExt->num_queues = (USHORT)adaptExt->msix_vectors;
+
+        // WHY NT_VERIFY + bugcheck: this is meant to shrink num_queues to however many MSI-X
+        // vectors were actually granted, but it assigns msix_vectors directly instead of
+        // msix_vectors - 3 (control/event/catch-all), so when fewer vectors are granted than
+        // requested, num_queues can come out *larger* than it was before (e.g. 8 queues with
+        // 10 granted vectors gives 10). VioScsiFindAdapter already sized the page/pool
+        // allocation and clamped against MAX_CPU using the smaller, pre-MSI-X-negotiation
+        // value, since msix_vectors isn't known until here - growing it now means
+        // InitializeVirtualQueues() and the fixed-size arrays get indexed past what was
+        // actually allocated/clamped for. Known bug, not yet fixed - this proves when it's
+        // actually hit rather than corrupting memory silently.
+        if (!NT_VERIFY(adaptExt->num_queues <= preMsiNumQueues))
+        {
+            KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, adaptExt->num_queues, preMsiNumQueues, adaptExt->msix_vectors);
+        }
     }
 
     if (!adaptExt->dump_mode && adaptExt->msix_vectors > 0)
@@ -714,6 +746,23 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
             adaptExt->tmf_cmd.SrbExtension = (PSRB_EXTENSION)VioScsiPoolAlloc(DeviceExtension, sizeof(SRB_EXTENSION));
             adaptExt->events = (PVirtIOSCSIEventNode)VioScsiPoolAlloc(DeviceExtension, sizeof(VirtIOSCSIEventNode) * 8);
             adaptExt->dpc = (PSTOR_DPC)VioScsiPoolAlloc(DeviceExtension, sizeof(STOR_DPC) * adaptExt->num_queues);
+
+            // WHY NT_VERIFY + bugcheck: none of these three allocations are checked for NULL
+            // before use - DeviceReset immediately dereferences tmf_cmd.SrbExtension, the
+            // hotplug event setup below indexes events[], and PassiveInitialize indexes
+            // dpc[index] - any of those would dereference/index through or near a NULL
+            // pointer if the allocation failed. Known bug, not yet fixed - this proves when
+            // it's actually hit rather than crashing on a NULL deref somewhere downstream
+            // with no indication of the real cause.
+            if (!NT_VERIFY(adaptExt->tmf_cmd.SrbExtension != NULL) || !NT_VERIFY(adaptExt->events != NULL) ||
+                !NT_VERIFY(adaptExt->dpc != NULL))
+            {
+                KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
+                            __LINE__,
+                            (ULONG_PTR)adaptExt->tmf_cmd.SrbExtension,
+                            (ULONG_PTR)adaptExt->events,
+                            (ULONG_PTR)adaptExt->dpc);
+            }
         }
     }
 
@@ -754,9 +803,25 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
                     perfData.FirstRedirectionMessageNumber = 3;
                     perfData.LastRedirectionMessageNumber = perfData.FirstRedirectionMessageNumber +
                                                             adaptExt->num_queues - 1;
-                    ASSERT(perfData.LastRedirectionMessageNumber < adaptExt->num_affinity);
                     if ((adaptExt->pmsg_affinity != NULL) && CHECKFLAG(perfData.Flags, STOR_PERF_ADV_CONFIG_LOCALITY))
                     {
+                        // WHY NT_VERIFY + bugcheck: LastRedirectionMessageNumber (derived from
+                        // num_queues, which the device negotiates) bounds how many GROUP_AFFINITY
+                        // entries StorPortInitializePerfOpts() writes into pmsg_affinity below,
+                        // which is only sized for num_affinity entries. If the device reports
+                        // enough queues to exceed that, Storport would write past the end of
+                        // pmsg_affinity and corrupt adjacent non-paged pool. Deliberately fatal
+                        // (not a graceful skip) while this driver is under hypervisor error
+                        // injection to find silent corruption - a recovered/clamped path here
+                        // would hide the violation instead of surfacing it.
+                        if (!NT_VERIFY(perfData.LastRedirectionMessageNumber < adaptExt->num_affinity))
+                        {
+                            KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
+                                        __LINE__,
+                                        perfData.LastRedirectionMessageNumber,
+                                        adaptExt->num_affinity,
+                                        0);
+                        }
                         RtlZeroMemory((PCHAR)adaptExt->pmsg_affinity,
                                       sizeof(GROUP_AFFINITY) * ((ULONGLONG)adaptExt->num_queues + 3));
                         adaptExt->perfFlags |= STOR_PERF_ADV_CONFIG_LOCALITY;
@@ -915,6 +980,19 @@ VOID HandleResponse(IN PVOID DeviceExtension, IN PVirtIOSCSICmd cmd)
         SRB_GET_SENSE_INFO(Srb, senseInfoBuffer, senseInfoBufferLength);
         if (senseInfoBufferLength >= FIELD_OFFSET(SENSE_DATA, CommandSpecificInformation))
         {
+            // WHY NT_VERIFY + bugcheck: min(resp->sense_len, senseInfoBufferLength) only
+            // clamps against the destination (caller's sense buffer) size - it does not clamp
+            // against resp->sense's actual size, VIRTIO_SCSI_SENSE_SIZE (96 bytes).
+            // resp->sense_len is device-reported and can exceed 96; if the destination sense
+            // buffer is also larger than 96 (common - SPC sense buffers are often 252 bytes),
+            // this reads past the end of resp->sense into adjacent SRB_EXTENSION memory
+            // (pointers, physical addresses) and copies it into the caller's sense buffer - an
+            // out-of-bounds read and info leak. Known bug, not yet fixed - this proves when
+            // it's actually hit rather than leaking memory silently.
+            if (!NT_VERIFY(resp->sense_len <= VIRTIO_SCSI_SENSE_SIZE))
+            {
+                KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, resp->sense_len, VIRTIO_SCSI_SENSE_SIZE, (ULONG_PTR)Srb);
+            }
             RtlCopyMemory(senseInfoBuffer, resp->sense, min(resp->sense_len, senseInfoBufferLength));
             if (srbStatus == SRB_STATUS_ERROR)
             {
@@ -967,7 +1045,7 @@ VioScsiInterrupt(IN PVOID DeviceExtension)
             {
                 VirtIOSCSICtrlTMFResp *resp;
                 Srb = (PSRB_TYPE)cmd->srb;
-                ASSERT(Srb == (PSRB_TYPE)&adaptExt->tmf_cmd.Srb);
+                NT_ASSERT(Srb == (PSRB_TYPE)&adaptExt->tmf_cmd.Srb);
                 resp = &cmd->resp.tmf;
                 switch (resp->response)
                 {
@@ -976,7 +1054,7 @@ VioScsiInterrupt(IN PVOID DeviceExtension)
                         break;
                     default:
                         RhelDbgPrint(TRACE_LEVEL_ERROR, " unknown response %d\n", resp->response);
-                        ASSERT(0);
+                        NT_ASSERT(0);
                         break;
                 }
                 StorPortResume(DeviceExtension);
@@ -1051,7 +1129,7 @@ static BOOLEAN VioScsiMSInterruptWorker(IN PVOID DeviceExtension, IN ULONG Messa
             {
                 VirtIOSCSICtrlTMFResp *resp;
                 Srb = (PSRB_TYPE)(cmd->srb);
-                ASSERT(Srb == (PSRB_TYPE)&adaptExt->tmf_cmd.Srb);
+                NT_ASSERT(Srb == (PSRB_TYPE)&adaptExt->tmf_cmd.Srb);
                 resp = &cmd->resp.tmf;
                 switch (resp->response)
                 {
@@ -1060,7 +1138,7 @@ static BOOLEAN VioScsiMSInterruptWorker(IN PVOID DeviceExtension, IN ULONG Messa
                         break;
                     default:
                         RhelDbgPrint(TRACE_LEVEL_ERROR, " Unknown response %d\n", resp->response);
-                        ASSERT(0);
+                        NT_ASSERT(0);
                         break;
                 }
                 StorPortResume(DeviceExtension);
@@ -1416,7 +1494,22 @@ VOID FORCEINLINE DispatchQueue(IN PVOID DeviceExtension, IN ULONG MessageId)
 
     if (!adaptExt->dump_mode && adaptExt->dpc_ok)
     {
-        NT_ASSERT(MessageId >= QUEUE_TO_MESSAGE(VIRTIO_SCSI_REQUEST_QUEUE_0));
+        // WHY NT_VERIFY + bugcheck: MessageId - QUEUE_TO_MESSAGE(VIRTIO_SCSI_REQUEST_QUEUE_0)
+        // indexes adaptExt->dpc[] below. If MessageId were smaller than the subtrahend, the
+        // unsigned subtraction underflows into a huge index, handing StorPortIssueDpc a wild
+        // pointer into adjacent pool memory instead of a real PSTOR_DPC. This should be
+        // unreachable under correct operation (Storport only hands back MessageIds this driver
+        // itself registered), so a violation means something is already broken - deliberately
+        // fatal rather than silently falling back, while this driver is under hypervisor error
+        // injection to find where it corrupts memory today.
+        if (!NT_VERIFY(MessageId >= QUEUE_TO_MESSAGE(VIRTIO_SCSI_REQUEST_QUEUE_0)))
+        {
+            KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
+                        __LINE__,
+                        MessageId,
+                        QUEUE_TO_MESSAGE(VIRTIO_SCSI_REQUEST_QUEUE_0),
+                        0);
+        }
         StorPortIssueDpc(DeviceExtension,
                          &adaptExt->dpc[MessageId - QUEUE_TO_MESSAGE(VIRTIO_SCSI_REQUEST_QUEUE_0)],
                          ULongToPtr(MessageId),
@@ -1443,6 +1536,18 @@ VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr)
     if (index >= (adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0))
     {
         index %= adaptExt->num_queues;
+    }
+
+    // WHY NT_VERIFY + bugcheck: the %= above drops the VIRTIO_SCSI_REQUEST_QUEUE_0 offset
+    // instead of preserving it, so whenever the wrap branch is taken, index lands below
+    // VIRTIO_SCSI_REQUEST_QUEUE_0. That underflows the processing_srbs[] index below into a
+    // huge value, and adaptExt->vq[index] can resolve to the control queue's virtqueue -
+    // this is the hottest of the three wraparound sites since ProcessQueue runs on every
+    // completion interrupt/DPC. Known bug, not yet fixed - this proves when it's actually
+    // hit rather than corrupting memory silently.
+    if (!NT_VERIFY(index >= VIRTIO_SCSI_REQUEST_QUEUE_0))
+    {
+        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, index, adaptExt->num_queues, 0);
     }
 
     PREQUEST_LIST element = &adaptExt->processing_srbs[index - VIRTIO_SCSI_REQUEST_QUEUE_0];
@@ -1849,10 +1954,33 @@ VOID VioScsiWmiSrb(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
     ENTER_FN_SRB();
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
-    ASSERT(SRB_FUNCTION(Srb) == SRB_FUNCTION_WMI);
-    ASSERT(SRB_LENGTH(Srb) == sizeof(SCSI_WMI_REQUEST_BLOCK));
-    ASSERT(SRB_DATA_TRANSFER_LENGTH(Srb) >= sizeof(ULONG));
-    ASSERT(SRB_DATA_BUFFER(Srb));
+    // WHY NT_VERIFY + bugcheck (all three below): SRB_DATA_TRANSFER_LENGTH(Srb)/
+    // SRB_DATA_BUFFER(Srb) get passed straight into ScsiPortWmiDispatchFunction() below with
+    // no further size check. If the SRB doesn't actually match these shape/size assumptions,
+    // that dispatch call reads/writes a buffer that's smaller than it expects - a buffer
+    // over-read/over-write. Checked individually (not combined) so a crash dump's bugcheck
+    // parameters identify exactly which assumption failed. Deliberately fatal rather than
+    // rejecting the SRB, while this driver is under hypervisor error injection to find where
+    // it corrupts memory today.
+    //
+    // NOTE: a fourth check used to live here, SRB_LENGTH(Srb) == sizeof(SCSI_WMI_REQUEST_BLOCK).
+    // It fired on every boot (confirmed via hypervisor-driven testing) because it encoded a
+    // legacy, fixed-layout SRB assumption that doesn't hold for the extended STORAGE_REQUEST_BLOCK
+    // model this driver (and Windows 11) actually uses for WMI - SRB_LENGTH legitimately differs
+    // from sizeof(SCSI_WMI_REQUEST_BLOCK) under that model. Removed as a false positive, not a
+    // real corruption risk: nothing downstream relies on that equality.
+    if (!NT_VERIFY(SRB_FUNCTION(Srb) == SRB_FUNCTION_WMI))
+    {
+        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, (ULONG_PTR)Srb, SRB_FUNCTION(Srb), 0);
+    }
+    if (!NT_VERIFY(SRB_DATA_TRANSFER_LENGTH(Srb) >= sizeof(ULONG)))
+    {
+        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, (ULONG_PTR)Srb, SRB_DATA_TRANSFER_LENGTH(Srb), 0);
+    }
+    if (!NT_VERIFY(SRB_DATA_BUFFER(Srb)))
+    {
+        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, (ULONG_PTR)Srb, 0, 0);
+    }
 
     if (!pSrbWmi)
     {
