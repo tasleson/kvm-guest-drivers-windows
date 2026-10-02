@@ -261,6 +261,7 @@ typedef struct _SRB_EXTENSION
     VRING_DESC_ALIAS desc_alias[VIRTIO_MAX_SG];
     ULONGLONG time;
     ULONG_PTR id;
+    ULONG QueueIndex; // index into ADAPTER_EXTENSION.processing_srbs / Telemetry.Queues, set by SendSRB
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
 
@@ -288,6 +289,98 @@ typedef struct _REQUEST_LIST
 // which is the pre-existing manually-triggered test path (VioscsiResetBugCheck).
 //
 #define VIOSCSI_BUGCHECK_CORRUPTION_GUARD 0xBAADC0DE
+
+//
+// Runtime performance/error telemetry, kept in the (non-paged) adapter
+// extension so it is present in a crash dump without any extra plumbing.
+// Magic/version let an offline tool or debugger script locate and
+// interpret the block without requiring an exact struct-layout match.
+//
+#define STOR_TELEMETRY_MAGIC      0x53505331 // 'SPS1'
+#define STOR_TELEMETRY_VERSION    1
+#define STOR_TELEMETRY_HISTOGRAM_BUCKETS 64
+#define STOR_TELEMETRY_STATUS_SLOTS     64
+
+typedef struct _LATENCY_STATS
+{
+    ULONG64 Buckets[STOR_TELEMETRY_HISTOGRAM_BUCKETS]; // bucket N covers [2^N, 2^(N+1)) microseconds
+    ULONG64 Count;
+    ULONG64 SumUs;
+    ULONG64 MinUs;
+    ULONG64 MaxUs;
+} LATENCY_STATS, *PLATENCY_STATS;
+
+typedef struct _QUEUE_TELEMETRY
+{
+    ULONG64 ReadCount;
+    ULONG64 WriteCount;
+    ULONG64 FlushCount;
+    ULONG64 UnmapCount;
+    ULONG64 OtherCount;
+    ULONG64 ReadBytes;
+    ULONG64 WriteBytes;
+    LATENCY_STATS Latency;
+    ULONG64 StatusHistogram[STOR_TELEMETRY_STATUS_SLOTS]; // indexed by SRB_STATUS_* (flag bits masked off)
+    ULONG InFlightHighWaterMark;
+    ULONG64 QueueFullCount; // virtqueue_add_buf() had no free descriptors
+} QUEUE_TELEMETRY, *PQUEUE_TELEMETRY;
+
+typedef struct _STOR_TELEMETRY
+{
+    ULONG Magic;
+    ULONG Version;
+    QUEUE_TELEMETRY Queues[MAX_CPU];
+
+    // Adapter-wide: resets aren't a per-queue event.
+    ULONG64 BusResetCount;
+    ULONG64 DeviceResetCount;
+    ULONG64 LogicalUnitResetCount;
+    ULONG64 LastResetDurationUs;
+    ULONG64 MaxResetDurationUs;
+} STOR_TELEMETRY, *PSTOR_TELEMETRY;
+
+FORCEINLINE ULONG
+StorPerfLatencyBucket(IN ULONGLONG ElapsedUs)
+{
+    ULONG bucket = 0;
+    ULONGLONG value = ElapsedUs;
+    while (value > 1 && bucket < (STOR_TELEMETRY_HISTOGRAM_BUCKETS - 1))
+    {
+        value >>= 1;
+        bucket++;
+    }
+    return bucket;
+}
+
+FORCEINLINE VOID
+StorPerfUpdateMin(IN OUT PULONG64 Target, IN ULONG64 Value)
+{
+    ULONG64 current = *Target;
+    while (current == 0 || Value < current)
+    {
+        ULONG64 prior = (ULONG64)InterlockedCompareExchange64((PLONG64)Target, (LONG64)Value, (LONG64)current);
+        if (prior == current)
+        {
+            return;
+        }
+        current = prior;
+    }
+}
+
+FORCEINLINE VOID
+StorPerfUpdateMax(IN OUT PULONG64 Target, IN ULONG64 Value)
+{
+    ULONG64 current = *Target;
+    while (Value > current)
+    {
+        ULONG64 prior = (ULONG64)InterlockedCompareExchange64((PLONG64)Target, (LONG64)Value, (LONG64)current);
+        if (prior == current)
+        {
+            return;
+        }
+        current = prior;
+    }
+}
 
 typedef struct virtio_bar
 {
@@ -364,6 +457,7 @@ typedef struct _ADAPTER_EXTENSION
     ULONGLONG fw_ver;
     ULONG resp_time;
     BOOLEAN bRemoved;
+    STOR_TELEMETRY Telemetry;
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
 
 #ifndef PCIX_TABLE_POINTER

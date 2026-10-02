@@ -361,6 +361,8 @@ VioScsiFindAdapter(IN PVOID DeviceExtension,
 
     adaptExt->dump_mode = IsCrashDumpMode;
     adaptExt->hba_id = HBA_ID;
+    adaptExt->Telemetry.Magic = STOR_TELEMETRY_MAGIC;
+    adaptExt->Telemetry.Version = STOR_TELEMETRY_VERSION;
     ConfigInfo->Master = TRUE;
     ConfigInfo->ScatterGather = TRUE;
     ConfigInfo->DmaWidth = Width32Bits;
@@ -1463,7 +1465,6 @@ VioScsiBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     }
     srbExt->in = sgElement - srbExt->out;
 
-    if (adaptExt->resp_time)
     {
         LARGE_INTEGER counter = {0};
         ULONG status = STOR_STATUS_SUCCESS;
@@ -1735,13 +1736,60 @@ PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                          SRB_TARGET_ID(Srb),
                          SRB_LUN(Srb),
                          Srb);
+
+            switch (SRB_FUNCTION(Srb))
+            {
+                case SRB_FUNCTION_RESET_BUS:
+                    InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.BusResetCount);
+                    break;
+                case SRB_FUNCTION_RESET_DEVICE:
+                    InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.DeviceResetCount);
+                    break;
+                case SRB_FUNCTION_RESET_LOGICAL_UNIT:
+                    InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.LogicalUnitResetCount);
+                    break;
+            }
+
             switch (adaptExt->action_on_reset)
             {
                 case VioscsiResetCompleteRequests:
+                {
+                    LARGE_INTEGER resetStart = {0};
+                    LARGE_INTEGER resetEnd = {0};
+                    LARGE_INTEGER freq = {0};
+                    ULONG qpcStatus;
+                    ULONG qpcEndStatus;
+
                     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Completing all pending SRBs\n");
+                    qpcStatus = StorPortQueryPerformanceCounter(DeviceExtension, &freq, &resetStart);
+                    if (qpcStatus != STOR_STATUS_SUCCESS)
+                    {
+                        RhelDbgPrint(TRACE_LEVEL_ERROR,
+                                     "StorPortQueryPerformanceCounter failed with status 0x%lx, reset duration will not be recorded\n",
+                                     qpcStatus);
+                    }
                     CompletePendingRequestsOnReset(DeviceExtension);
+                    if (qpcStatus == STOR_STATUS_SUCCESS && freq.QuadPart != 0)
+                    {
+                        qpcEndStatus = StorPortQueryPerformanceCounter(DeviceExtension, NULL, &resetEnd);
+                        if (qpcEndStatus == STOR_STATUS_SUCCESS)
+                        {
+                            ULONG64 durationUs =
+                                (ULONG64)(((resetEnd.QuadPart - resetStart.QuadPart) * 1000000) / freq.QuadPart);
+                            adaptExt->Telemetry.LastResetDurationUs = durationUs;
+                            StorPerfUpdateMax(&adaptExt->Telemetry.MaxResetDurationUs, durationUs);
+                        }
+                        else
+                        {
+                            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                                         "StorPortQueryPerformanceCounter failed with status 0x%lx, reset duration will not "
+                                         "be recorded\n",
+                                         qpcEndStatus);
+                        }
+                    }
                     SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
                     return TRUE;
+                }
                 case VioscsiResetDoNothing:
                     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Doing nothing with all pending SRBs\n");
                     SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
@@ -1806,6 +1854,79 @@ VOID PostProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     EXIT_FN_SRB();
 }
 
+VOID
+FORCEINLINE
+RecordIoCompletionStats(IN PADAPTER_EXTENSION adaptExt, IN PSRB_TYPE Srb, IN PSRB_EXTENSION srbExt, IN ULONGLONG ElapsedUs)
+{
+    PQUEUE_TELEMETRY queueStats;
+    PCDB cdb;
+    ULONG dataLen;
+    UCHAR srbStatus;
+    UCHAR statusIndex;
+    ULONG bucket;
+
+    if (SRB_FUNCTION(Srb) != SRB_FUNCTION_EXECUTE_SCSI || srbExt->QueueIndex >= adaptExt->num_queues)
+    {
+        return;
+    }
+
+    queueStats = &adaptExt->Telemetry.Queues[srbExt->QueueIndex];
+    dataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
+
+    bucket = StorPerfLatencyBucket(ElapsedUs);
+    InterlockedIncrement64((PLONG64)&queueStats->Latency.Buckets[bucket]);
+    InterlockedIncrement64((PLONG64)&queueStats->Latency.Count);
+    InterlockedExchangeAdd64((PLONG64)&queueStats->Latency.SumUs, (LONG64)ElapsedUs);
+    StorPerfUpdateMin(&queueStats->Latency.MinUs, ElapsedUs);
+    StorPerfUpdateMax(&queueStats->Latency.MaxUs, ElapsedUs);
+
+    srbStatus = SrbGetSrbStatus(Srb);
+    statusIndex = srbStatus & ~(SRB_STATUS_QUEUE_FROZEN | SRB_STATUS_AUTOSENSE_VALID);
+    if (statusIndex >= STOR_TELEMETRY_STATUS_SLOTS)
+    {
+        statusIndex = STOR_TELEMETRY_STATUS_SLOTS - 1;
+    }
+    InterlockedIncrement64((PLONG64)&queueStats->StatusHistogram[statusIndex]);
+
+    cdb = SRB_CDB(Srb);
+    if (!cdb)
+    {
+        InterlockedIncrement64((PLONG64)&queueStats->OtherCount);
+        return;
+    }
+
+    switch (cdb->CDB6GENERIC.OperationCode)
+    {
+        case SCSIOP_READ6:
+        case SCSIOP_READ:
+        case SCSIOP_READ12:
+        case SCSIOP_READ16:
+            InterlockedIncrement64((PLONG64)&queueStats->ReadCount);
+            InterlockedExchangeAdd64((PLONG64)&queueStats->ReadBytes, dataLen);
+            break;
+        case SCSIOP_WRITE6:
+        case SCSIOP_WRITE:
+        case SCSIOP_WRITE12:
+        case SCSIOP_WRITE16:
+        case SCSIOP_WRITE_VERIFY:
+        case SCSIOP_WRITE_VERIFY12:
+        case SCSIOP_WRITE_VERIFY16:
+            InterlockedIncrement64((PLONG64)&queueStats->WriteCount);
+            InterlockedExchangeAdd64((PLONG64)&queueStats->WriteBytes, dataLen);
+            break;
+        case SCSIOP_SYNCHRONIZE_CACHE:
+        case SCSIOP_SYNCHRONIZE_CACHE16:
+            InterlockedIncrement64((PLONG64)&queueStats->FlushCount);
+            break;
+        case SCSIOP_UNMAP:
+            InterlockedIncrement64((PLONG64)&queueStats->UnmapCount);
+            break;
+        default:
+            InterlockedIncrement64((PLONG64)&queueStats->OtherCount);
+            break;
+    }
+}
+
 VOID CompleteRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
 {
     PADAPTER_EXTENSION adaptExt = NULL;
@@ -1815,18 +1936,22 @@ VOID CompleteRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
     PostProcessRequest(DeviceExtension, Srb);
 
-    if (adaptExt->resp_time)
+    srbExt = SRB_EXTENSION(Srb);
+    if (srbExt->time != 0)
     {
-        srbExt = SRB_EXTENSION(Srb);
-        if (srbExt->time != 0)
-        {
-            LARGE_INTEGER counter = {0};
-            LARGE_INTEGER freq = {0};
-            ULONG status = StorPortQueryPerformanceCounter(DeviceExtension, &freq, &counter);
+        LARGE_INTEGER counter = {0};
+        LARGE_INTEGER freq = {0};
+        ULONG status = StorPortQueryPerformanceCounter(DeviceExtension, &freq, &counter);
 
-            if (status == STOR_STATUS_SUCCESS)
+        if (status == STOR_STATUS_SUCCESS)
+        {
+            ULONGLONG elapsed_us = ((counter.QuadPart - srbExt->time) * 1000000) / freq.QuadPart;
+            ULONGLONG time_msec = elapsed_us / 1000;
+
+            RecordIoCompletionStats(adaptExt, Srb, srbExt, elapsed_us);
+
+            if (adaptExt->resp_time)
             {
-                ULONGLONG time_msec = ((counter.QuadPart - srbExt->time) * 1000) / freq.QuadPart;
                 RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                              "time_msec %I64d Start %llu End %llu Freq %llu\n",
                              time_msec,
@@ -1857,13 +1982,13 @@ VOID CompleteRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                     }
                 }
             }
-            else
-            {
-                RhelDbgPrint(TRACE_LEVEL_ERROR,
-                             "SRB 0x%p StorPortQueryPerformanceCounter failed with status  0x%lx\n",
-                             Srb,
-                             status);
-            }
+        }
+        else
+        {
+            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                         "SRB 0x%p StorPortQueryPerformanceCounter failed with status  0x%lx\n",
+                         Srb,
+                         status);
         }
     }
     StorPortNotification(RequestComplete, DeviceExtension, Srb);
