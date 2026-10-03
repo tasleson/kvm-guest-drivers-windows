@@ -456,7 +456,7 @@ typedef struct _STOR_TELEMETRY
     ULONG64 LogicalUnitResetCount;
     ULONG64 LastResetDurationUs;
     ULONG64 MaxResetDurationUs;
-    ULONG64 DeviceResetTmfInFlightCount; // DeviceReset() entered while a TMF was already in flight
+    ULONG64 DeviceResetTmfInFlightCount; // DeviceReset() coalesced into a TMF already in flight
     ULONG64 LastResetTime;               // when the last bus/device/LUN reset request arrived
     ULONG64 SnapshotTime;                // when the last IOCTL snapshot was taken, the "now" for live ages
     ULONG64 OutOfRangeTargetCount;       // requests VioScsiBuildIo refused for a target ID the device doesn't have
@@ -662,7 +662,9 @@ typedef struct _ADAPTER_EXTENSION
     BOOLEAN indirect;
 
     TMF_COMMAND tmf_cmd;
-    BOOLEAN tmf_infly;
+    // TRUE while tmf_cmd is owned by DeviceReset or the device. Only modify it with
+    // Interlocked* operations, see DeviceReset.
+    volatile LONG tmf_infly;
 
     PVirtIOSCSIEventNode events;
 
