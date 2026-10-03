@@ -338,7 +338,9 @@ typedef struct _ADAPTER_EXTENSION
     BOOLEAN indirect;
 
     TMF_COMMAND tmf_cmd;
-    BOOLEAN tmf_infly;
+    // TRUE while tmf_cmd is owned by DeviceReset or the device. Only modify it with
+    // Interlocked* operations, see DeviceReset.
+    volatile LONG tmf_infly;
 
     PVirtIOSCSIEventNode events;
 

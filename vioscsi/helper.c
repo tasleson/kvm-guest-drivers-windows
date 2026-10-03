@@ -241,18 +241,20 @@ DeviceReset(IN PVOID DeviceExtension)
     {
         return TRUE;
     }
-    // WHY NT_VERIFY + bugcheck: adaptExt->tmf_cmd/srbExt is a single shared per-adapter
-    // structure, not per-request. If a second TMF were built here while one is already in
-    // flight, this would overwrite the in-flight command's SRB/SG state out from under it,
-    // so when it eventually completes, the driver would act on the wrong request's data.
-    // DeviceReset should be unreachable while a prior TMF is in flight under correct
-    // operation (Storport serializes reset handling) - hitting this means our own
-    // concurrency assumptions already broke down, so a quiet "return FALSE" would let the
-    // driver keep running on top of an already-violated invariant. Deliberately fatal while
-    // this driver is under hypervisor error injection to find where it corrupts memory today.
-    if (!NT_VERIFY(adaptExt->tmf_infly == FALSE))
+    // tmf_cmd is a single per-adapter buffer, and it belongs to the device from the moment
+    // it is posted on the control queue until the ISR reaps it. This routine doesn't wait
+    // for that: it reports success as soon as the TMF is posted, so Storport is free to
+    // call it again (hierarchical reset escalating LUN -> target -> bus, or reset SRBs in
+    // BuildIo on other CPUs) while the first TMF is still outstanding. That is normal
+    // interrupt/DPC latency, not a fault. Claim the buffer atomically, and before posting
+    // it, so the ISR can't see a completion for a TMF it doesn't know is in flight. If one
+    // is already outstanding, fold this request into it: every reset level sends the same
+    // TMF, so a second one would add nothing, and rebuilding tmf_cmd now would corrupt the
+    // buffer the device still owns.
+    if (InterlockedCompareExchange(&adaptExt->tmf_infly, TRUE, FALSE) != FALSE)
     {
-        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, (ULONG_PTR)adaptExt, adaptExt->tmf_infly, 0);
+        RhelDbgPrint(TRACE_LEVEL_WARNING, " TMF already in flight, coalescing this reset into it.\n");
+        return TRUE;
     }
     Srb->SrbExtension = srbExt;
     RtlZeroMemory((PVOID)cmd, sizeof(VirtIOSCSICmd));
@@ -278,10 +280,14 @@ DeviceReset(IN PVOID DeviceExtension)
     StorPortPause(DeviceExtension, 60);
     if (!SendTMF(DeviceExtension, Srb))
     {
+        // Resets folded into this one while it was being built have already returned TRUE.
+        // Not expected while tmf_infly limits the control queue to this single TMF. Resume
+        // before releasing tmf_cmd, see ProcessTMFCompletion.
+        RhelDbgPrint(TRACE_LEVEL_ERROR, " Failed to post TMF, coalesced resets were not sent.\n");
         StorPortResume(DeviceExtension);
+        InterlockedExchange(&adaptExt->tmf_infly, FALSE);
         return FALSE;
     }
-    adaptExt->tmf_infly = TRUE;
     return TRUE;
 }
 
@@ -295,6 +301,15 @@ VOID ShutDown(IN PVOID DeviceExtension)
     for (index = VIRTIO_SCSI_CONTROL_QUEUE; index < adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0; ++index)
     {
         adaptExt->vq[index] = NULL;
+    }
+    // The device reset above dropped every buffer the device was holding, so a TMF still in
+    // flight will never be completed. Take tmf_cmd back now that the queues are gone,
+    // otherwise tmf_infly stays set across the restart and every later reset gets folded
+    // into one that no longer exists. The StorPortResume matching DeviceReset's pause was
+    // going to come from that completion.
+    if (InterlockedExchange(&adaptExt->tmf_infly, FALSE) != FALSE)
+    {
+        StorPortResume(DeviceExtension);
     }
 
     virtio_device_shutdown(&adaptExt->vdev);
