@@ -101,18 +101,27 @@ FORCEINLINE VOID SrbGetPnpInfo(_In_ PVOID Srb, ULONG *PnPFlags, ULONG *PnPAction
 #define SRB_SET_DATA_TRANSFER_LENGTH(Srb, Len)     SrbSetDataTransferLength(Srb, Len)
 #define SRB_GET_TIMEOUTVALUE(Srb)                  SrbGetTimeOutValue(Srb)
 
-VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
+typedef struct _VIO_QUEUE_LOCK
+{
+    STOR_LOCK_HANDLE InterruptLock;
+    ULONG OldIrql;
+} VIO_QUEUE_LOCK, *PVIO_QUEUE_LOCK;
 
-BOOLEAN
-SendTMF(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
+FORCEINLINE BOOLEAN VioScsiIsRequestMessage(PADAPTER_EXTENSION adaptExt, ULONG MessageId)
+{
+    return MessageId >= QUEUE_TO_MESSAGE(VIRTIO_SCSI_REQUEST_QUEUE_0) &&
+           MessageId - QUEUE_TO_MESSAGE(VIRTIO_SCSI_REQUEST_QUEUE_0) < adaptExt->num_queues;
+}
+
+VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
 
 VOID ShutDown(IN PVOID DeviceExtension);
 
 BOOLEAN
-DeviceReset(IN PVOID DeviceExtension);
+DeviceReset(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
 
 VOID GetScsiConfig(IN PVOID DeviceExtension);
-VOID SetGuestFeatures(IN PVOID DeviceExtension);
+BOOLEAN SetGuestFeatures(IN PVOID DeviceExtension);
 
 BOOLEAN
 InitVirtIODevice(IN PVOID DeviceExtension);
@@ -134,9 +143,9 @@ VOID ProcessBuffer(IN PVOID DeviceExtension, IN ULONG MessageId, IN STOR_SPINLOC
 
 VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr);
 
-VOID VioScsiVQLock(IN PVOID DeviceExtension, IN ULONG MessageID, IN OUT PSTOR_LOCK_HANDLE LockHandle, IN BOOLEAN isr);
+VOID VioScsiVQLock(IN PVOID DeviceExtension, IN ULONG MessageID, IN OUT PVIO_QUEUE_LOCK LockHandle, IN BOOLEAN isr);
 
-VOID VioScsiVQUnlock(IN PVOID DeviceExtension, IN ULONG MessageID, IN PSTOR_LOCK_HANDLE LockHandle, IN BOOLEAN isr);
+VOID VioScsiVQUnlock(IN PVOID DeviceExtension, IN ULONG MessageID, IN PVIO_QUEUE_LOCK LockHandle, IN BOOLEAN isr);
 
 VOID HandleResponse(IN PVOID DeviceExtension, IN PVirtIOSCSICmd cmd);
 

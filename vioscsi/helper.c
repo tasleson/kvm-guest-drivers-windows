@@ -51,7 +51,7 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     ULONGLONG pa = 0;
     ULONG QueueNumber = VIRTIO_SCSI_REQUEST_QUEUE_0;
     BOOLEAN notify = FALSE;
-    STOR_LOCK_HANDLE LockHandle = {0};
+    VIO_QUEUE_LOCK LockHandle = {0};
     ULONG status = STOR_STATUS_SUCCESS;
     UCHAR ScsiStatus = SCSISTAT_GOOD;
     ULONG MessageId;
@@ -74,29 +74,16 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         return;
     }
 
-    if (adaptExt->reset_in_progress)
-    {
-        RhelDbgPrint(TRACE_LEVEL_FATAL, " Reset is in progress, completing SRB 0x%p with SRB_STATUS_BUS_RESET.\n", Srb);
-        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
-        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUS_RESET);
-        CompleteRequest(DeviceExtension, Srb);
-        return;
-    }
-
     LOG_SRB_INFO();
 
     if (adaptExt->num_queues > 1)
     {
-        STARTIO_PERFORMANCE_PARAMETERS param;
+        STARTIO_PERFORMANCE_PARAMETERS param = {0};
         param.Size = sizeof(STARTIO_PERFORMANCE_PARAMETERS);
         status = StorPortGetStartIoPerfParams(DeviceExtension, (PSCSI_REQUEST_BLOCK)Srb, &param);
-        if (status == STOR_STATUS_SUCCESS && param.MessageNumber != 0)
+        if (status == STOR_STATUS_SUCCESS && VioScsiIsRequestMessage(adaptExt, param.MessageNumber))
         {
             QueueNumber = MESSAGE_TO_QUEUE(param.MessageNumber);
-            if (QueueNumber >= adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0)
-            {
-                QueueNumber %= adaptExt->num_queues;
-            }
         }
         else
         {
@@ -108,24 +95,13 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         }
     }
 
-    // WHY NT_VERIFY + bugcheck: QueueNumber %= adaptExt->num_queues above drops the
-    // VIRTIO_SCSI_REQUEST_QUEUE_0 offset instead of preserving it (should be
-    // VIRTIO_SCSI_REQUEST_QUEUE_0 + ((QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0) %
-    // num_queues)), so whenever the wrap branch is taken, QueueNumber lands below
-    // VIRTIO_SCSI_REQUEST_QUEUE_0. That underflows vq_req_idx below into a huge index into
-    // processing_srbs[], and adaptExt->vq[QueueNumber] can resolve to the control queue's
-    // virtqueue, posting a SCSI command on the TMF control queue. Known bug, not yet fixed -
-    // this proves when it's actually hit rather than letting it corrupt memory silently.
-    if (!NT_VERIFY(QueueNumber >= VIRTIO_SCSI_REQUEST_QUEUE_0))
-    {
-        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, QueueNumber, adaptExt->num_queues, 0);
-    }
-
     srbExt = SRB_EXTENSION(Srb);
 
     if (!srbExt)
     {
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " No SRB Extenstion for SRB 0x%p \n", Srb);
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_INVALID_REQUEST);
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        CompleteRequest(DeviceExtension, Srb);
         return;
     }
 
@@ -133,6 +109,18 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     vq_req_idx = QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0;
 
     VioScsiVQLock(DeviceExtension, MessageId, &LockHandle, FALSE);
+
+    if (adaptExt->bRemoved || !adaptExt->vq[QueueNumber] ||
+        (adaptExt->removed_luns[SRB_TARGET_ID(Srb)][SRB_LUN(Srb) / 8] & (1 << (SRB_LUN(Srb) % 8))) ||
+        adaptExt->tmf_infly)
+    {
+        UCHAR SrbStatus = adaptExt->tmf_infly ? SRB_STATUS_BUSY : SRB_STATUS_NO_DEVICE;
+        VioScsiVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
+        SRB_SET_SRB_STATUS(Srb, SrbStatus);
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        CompleteRequest(DeviceExtension, Srb);
+        return;
+    }
 
     element = &adaptExt->processing_srbs[vq_req_idx];
 
@@ -180,115 +168,67 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                      Srb->TimeOutValue);
         CompleteRequest(DeviceExtension, Srb);
     }
-    VioScsiVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
     if (notify)
     {
         virtqueue_notify(adaptExt->vq[QueueNumber]);
     }
+    VioScsiVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
 
     EXIT_FN_SRB();
 }
 
-BOOLEAN
-SynchronizedTMFRoutine(IN PVOID DeviceExtension, IN PVOID Context)
+static BOOLEAN SynchronizedDeviceReset(IN PVOID DeviceExtension, IN PVOID Context)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    PSCSI_REQUEST_BLOCK Srb = (PSCSI_REQUEST_BLOCK)Context;
-    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
+    PSRB_TYPE Srb = (PSRB_TYPE)Context;
+    PSRB_EXTENSION srbExt = adaptExt->tmf_cmd.SrbExtension;
+    VirtIOSCSICmd *cmd;
+    ULONG fragLen;
     PVOID va;
     ULONGLONG pa;
 
-    ENTER_FN();
-    SET_VA_PA();
-    if (virtqueue_add_buf(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE],
-                          srbExt->psgl,
-                          srbExt->out,
-                          srbExt->in,
-                          &srbExt->cmd,
-                          va,
-                          pa) >= 0)
+    if (adaptExt->bRemoved || !srbExt || !adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE] || adaptExt->tmf_infly)
     {
-        virtqueue_kick(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE]);
-        EXIT_FN();
-        return TRUE;
-    }
-    SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUSY);
-    StorPortBusy(DeviceExtension, adaptExt->queue_depth);
-    EXIT_ERR();
-    return FALSE;
-}
-
-BOOLEAN
-SendTMF(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
-{
-    ENTER_FN();
-    return StorPortSynchronizeAccess(DeviceExtension, SynchronizedTMFRoutine, (PVOID)Srb);
-    EXIT_FN();
-}
-
-BOOLEAN
-DeviceReset(IN PVOID DeviceExtension)
-{
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    PSCSI_REQUEST_BLOCK Srb = &adaptExt->tmf_cmd.Srb;
-    PSRB_EXTENSION srbExt = adaptExt->tmf_cmd.SrbExtension;
-    VirtIOSCSICmd *cmd = &srbExt->cmd;
-    ULONG fragLen;
-    ULONG sgElement;
-
-    ENTER_FN();
-    if (adaptExt->dump_mode)
-    {
-        return TRUE;
-    }
-    // tmf_cmd is a single per-adapter buffer, and it belongs to the device from the moment
-    // it is posted on the control queue until the ISR reaps it. This routine doesn't wait
-    // for that: it reports success as soon as the TMF is posted, so Storport is free to
-    // call it again (hierarchical reset escalating LUN -> target -> bus, or reset SRBs in
-    // BuildIo on other CPUs) while the first TMF is still outstanding. That is normal
-    // interrupt/DPC latency, not a fault. Claim the buffer atomically, and before posting
-    // it, so the ISR can't see a completion for a TMF it doesn't know is in flight. If one
-    // is already outstanding, fold this request into it: every reset level sends the same
-    // TMF, so a second one would add nothing, and rebuilding tmf_cmd now would corrupt the
-    // buffer the device still owns.
-    if (InterlockedCompareExchange(&adaptExt->tmf_infly, TRUE, FALSE) != FALSE)
-    {
-        RhelDbgPrint(TRACE_LEVEL_WARNING, " TMF already in flight, coalescing this reset into it.\n");
-        return TRUE;
-    }
-    Srb->SrbExtension = srbExt;
-    RtlZeroMemory((PVOID)cmd, sizeof(VirtIOSCSICmd));
-    cmd->srb = (PVOID)Srb;
-    cmd->req.tmf.lun[0] = 1;
-    cmd->req.tmf.lun[1] = 0;
-    cmd->req.tmf.lun[2] = 0;
-    cmd->req.tmf.lun[3] = 0;
-    cmd->req.tmf.type = VIRTIO_SCSI_T_TMF;
-    cmd->req.tmf.subtype = VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET;
-
-    srbExt->psgl = srbExt->vio_sg;
-    srbExt->pdesc = srbExt->desc_alias;
-    sgElement = 0;
-    srbExt->psgl[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &cmd->req.tmf, &fragLen);
-    srbExt->psgl[sgElement].length = sizeof(cmd->req.tmf);
-    sgElement++;
-    srbExt->out = sgElement;
-    srbExt->psgl[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &cmd->resp.tmf, &fragLen);
-    srbExt->psgl[sgElement].length = sizeof(cmd->resp.tmf);
-    sgElement++;
-    srbExt->in = sgElement - srbExt->out;
-    StorPortPause(DeviceExtension, 60);
-    if (!SendTMF(DeviceExtension, Srb))
-    {
-        // Resets folded into this one while it was being built have already returned TRUE.
-        // Not expected while tmf_infly limits the control queue to this single TMF. Resume
-        // before releasing tmf_cmd, see ProcessTMFCompletion.
-        RhelDbgPrint(TRACE_LEVEL_ERROR, " Failed to post TMF, coalesced resets were not sent.\n");
-        StorPortResume(DeviceExtension);
-        InterlockedExchange(&adaptExt->tmf_infly, FALSE);
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUSY);
         return FALSE;
     }
+
+    cmd = &srbExt->cmd;
+    RtlZeroMemory(cmd, sizeof(*cmd));
+    cmd->srb = Srb;
+    cmd->req.tmf.lun[0] = 1;
+    cmd->req.tmf.lun[1] = SRB_TARGET_ID(Srb);
+    cmd->req.tmf.lun[3] = SRB_LUN(Srb);
+    cmd->req.tmf.type = VIRTIO_SCSI_T_TMF;
+    cmd->req.tmf.subtype = SRB_FUNCTION(Srb) == SRB_FUNCTION_RESET_DEVICE ? VIRTIO_SCSI_T_TMF_I_T_NEXUS_RESET
+                                                                          : VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET;
+    srbExt->psgl = srbExt->vio_sg;
+    srbExt->pdesc = srbExt->desc_alias;
+    srbExt->psgl[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &cmd->req.tmf, &fragLen);
+    srbExt->psgl[0].length = sizeof(cmd->req.tmf);
+    srbExt->psgl[1].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &cmd->resp.tmf, &fragLen);
+    srbExt->psgl[1].length = sizeof(cmd->resp.tmf);
+    SET_VA_PA();
+
+    // Publish ownership before kicking; all request-message locks are held here.
+    adaptExt->tmf_infly = TRUE;
+    SRB_SET_SRB_STATUS(Srb, SRB_STATUS_PENDING);
+    StorPortPause(DeviceExtension, 60);
+    if (virtqueue_add_buf(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE], srbExt->psgl, 1, 1, cmd, va, pa) < 0)
+    {
+        StorPortResume(DeviceExtension);
+        adaptExt->tmf_infly = FALSE;
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUSY);
+        return FALSE;
+    }
+    virtqueue_kick(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE]);
     return TRUE;
+}
+
+BOOLEAN DeviceReset(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
+{
+    SRB_SET_SRB_STATUS(Srb, SRB_STATUS_ERROR);
+    return StorPortSynchronizeAccess(DeviceExtension, SynchronizedDeviceReset, Srb);
 }
 
 VOID ShutDown(IN PVOID DeviceExtension)
@@ -302,14 +242,28 @@ VOID ShutDown(IN PVOID DeviceExtension)
     {
         adaptExt->vq[index] = NULL;
     }
-    // The device reset above dropped every buffer the device was holding, so a TMF still in
-    // flight will never be completed. Take tmf_cmd back now that the queues are gone,
-    // otherwise tmf_infly stays set across the restart and every later reset gets folded
-    // into one that no longer exists. The StorPortResume matching DeviceReset's pause was
-    // going to come from that completion.
-    if (InterlockedExchange(&adaptExt->tmf_infly, FALSE) != FALSE)
+    for (index = 0; index < adaptExt->num_queues; ++index)
     {
+        PREQUEST_LIST element = &adaptExt->processing_srbs[index];
+        while (!IsListEmpty(&element->srb_list))
+        {
+            PLIST_ENTRY entry = RemoveHeadList(&element->srb_list);
+            PSRB_EXTENSION srbExt = CONTAINING_RECORD(entry, SRB_EXTENSION, list_entry);
+            PSCSI_REQUEST_BLOCK Srb = srbExt->Srb;
+            UCHAR status = srbExt->completion_status ? srbExt->completion_status : SRB_STATUS_BUS_RESET;
+            element->srb_cnt--;
+            SRB_SET_SRB_STATUS(Srb, status);
+            SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+            StorPortNotification(RequestComplete, DeviceExtension, Srb);
+        }
+    }
+    if (adaptExt->tmf_infly)
+    {
+        PSRB_TYPE Srb = (PSRB_TYPE)adaptExt->tmf_cmd.SrbExtension->cmd.srb;
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUS_RESET);
+        StorPortNotification(RequestComplete, DeviceExtension, Srb);
         StorPortResume(DeviceExtension);
+        adaptExt->tmf_infly = FALSE;
     }
 
     virtio_device_shutdown(&adaptExt->vdev);
@@ -387,7 +341,7 @@ VOID GetScsiConfig(IN PVOID DeviceExtension)
     EXIT_FN();
 }
 
-VOID SetGuestFeatures(IN PVOID DeviceExtension)
+BOOLEAN SetGuestFeatures(IN PVOID DeviceExtension)
 {
     ULONGLONG guestFeatures = 0;
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
@@ -428,9 +382,11 @@ VOID SetGuestFeatures(IN PVOID DeviceExtension)
     if (!NT_SUCCESS(virtio_set_features(&adaptExt->vdev, guestFeatures)))
     {
         RhelDbgPrint(TRACE_LEVEL_FATAL, " virtio_set_features failed\n");
+        return FALSE;
     }
 
     EXIT_FN();
+    return TRUE;
 }
 
 BOOLEAN
@@ -478,6 +434,7 @@ InitHW(IN PVOID DeviceExtension, IN PPORT_CONFIGURATION_INFORMATION ConfigInfo)
 
     {
         UCHAR CapOffset;
+        ULONG CapCount = 0;
         PPCI_MSIX_CAPABILITY pMsixCapOffset;
         PPCI_COMMON_HEADER pPciComHeader;
         pPciComHeader = &adaptExt->pci_config;
@@ -492,9 +449,18 @@ InitHW(IN PVOID DeviceExtension, IN PPORT_CONFIGURATION_INFORMATION ConfigInfo)
                 CapOffset = pPciComHeader->u.type0.CapabilitiesPtr;
                 while (CapOffset != 0)
                 {
+                    if (++CapCount > 48 || CapOffset < sizeof(PCI_COMMON_HEADER) || (CapOffset & 3) ||
+                        CapOffset > sizeof(adaptExt->pci_config_buf) - sizeof(PCI_CAPABILITIES_HEADER))
+                    {
+                        return FALSE;
+                    }
                     pMsixCapOffset = (PPCI_MSIX_CAPABILITY)&adaptExt->pci_config_buf[CapOffset];
                     if (pMsixCapOffset->Header.CapabilityID == PCI_CAPABILITY_ID_MSIX)
                     {
+                        if (CapOffset > sizeof(adaptExt->pci_config_buf) - sizeof(*pMsixCapOffset))
+                        {
+                            return FALSE;
+                        }
                         RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                                      "MessageControl.TableSize = %d\n",
                                      pMsixCapOffset->MessageControl.TableSize);
@@ -593,115 +559,87 @@ KickEvent(IN PVOID DeviceExtension, IN PVirtIOSCSIEventNode EventNode)
     EXIT_FN();
 }
 
-VOID VioScsiVQLock(IN PVOID DeviceExtension, IN ULONG MessageID, IN OUT PSTOR_LOCK_HANDLE LockHandle, IN BOOLEAN isr)
+VOID VioScsiVQLock(IN PVOID DeviceExtension, IN ULONG MessageID, IN OUT PVIO_QUEUE_LOCK LockHandle, IN BOOLEAN isr)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    ULONG QueueNumber = MESSAGE_TO_QUEUE(MessageID);
-    ENTER_FN();
-
+    // The adapter InterruptLock also acquires these message locks, excluding
+    // submissions and DPC queue access while stop/reset tears down the queues.
     if (!isr)
     {
         if (adaptExt->msix_enabled)
         {
-            // WHY NT_VERIFY + bugcheck: Queue numbers start at 0, message ids at 1 (comment
-            // above), so QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0 below indexes
-            // adaptExt->dpc[]. If MessageID were <= VIRTIO_SCSI_REQUEST_QUEUE_0, that unsigned
-            // subtraction underflows into a huge index, handing StorPortAcquireSpinLock a wild
-            // pointer instead of a real per-queue DPC lock. This should be unreachable under
-            // correct operation, so a violation means something is already broken -
-            // deliberately fatal rather than silently falling back to a different lock, while
-            // this driver is under hypervisor error injection to find where it corrupts memory
-            // today.
-            if (!NT_VERIFY(MessageID > VIRTIO_SCSI_REQUEST_QUEUE_0))
-            {
-                KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
-                            __LINE__,
-                            MessageID,
-                            VIRTIO_SCSI_REQUEST_QUEUE_0,
-                            0);
-            }
-            if (QueueNumber >= (adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0))
-            {
-                QueueNumber %= adaptExt->num_queues;
-            }
-            // WHY NT_VERIFY + bugcheck: the %= above drops the VIRTIO_SCSI_REQUEST_QUEUE_0
-            // offset instead of preserving it, so whenever the wrap branch is taken,
-            // QueueNumber lands below VIRTIO_SCSI_REQUEST_QUEUE_0 and the dpc[] index below
-            // underflows into a huge value. Known bug, not yet fixed - this proves when it's
-            // actually hit rather than handing StorPortAcquireSpinLock a wild pointer.
-            if (!NT_VERIFY(QueueNumber >= VIRTIO_SCSI_REQUEST_QUEUE_0))
-            {
-                KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, QueueNumber, adaptExt->num_queues, 0);
-            }
-            StorPortAcquireSpinLock(DeviceExtension,
-                                    DpcLock,
-                                    &adaptExt->dpc[QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0],
-                                    LockHandle);
+            StorPortAcquireMSISpinLock(DeviceExtension,
+                                       adaptExt->msix_one_vector ? 0 : MessageID,
+                                       &LockHandle->OldIrql);
         }
         else
         {
-            StorPortAcquireSpinLock(DeviceExtension, InterruptLock, NULL, LockHandle);
+            StorPortAcquireSpinLock(DeviceExtension, InterruptLock, NULL, &LockHandle->InterruptLock);
         }
     }
-    EXIT_FN();
 }
 
-VOID VioScsiVQUnlock(IN PVOID DeviceExtension, IN ULONG MessageID, IN PSTOR_LOCK_HANDLE LockHandle, IN BOOLEAN isr)
+VOID VioScsiVQUnlock(IN PVOID DeviceExtension, IN ULONG MessageID, IN PVIO_QUEUE_LOCK LockHandle, IN BOOLEAN isr)
 {
-    ENTER_FN();
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
     if (!isr)
     {
-        StorPortReleaseSpinLock(DeviceExtension, LockHandle);
+        if (adaptExt->msix_enabled)
+        {
+            StorPortReleaseMSISpinLock(DeviceExtension, adaptExt->msix_one_vector ? 0 : MessageID, LockHandle->OldIrql);
+        }
+        else
+        {
+            StorPortReleaseSpinLock(DeviceExtension, &LockHandle->InterruptLock);
+        }
     }
-    EXIT_FN();
 }
 
 VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
 {
     PADAPTER_EXTENSION adaptExt;
-    PSRB_EXTENSION srbExt = NULL;
     ULONG dataLen = 0;
     PSRB_IO_CONTROL srbControl = NULL;
     PFIRMWARE_REQUEST_BLOCK firmwareRequest = NULL;
     ENTER_FN();
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    srbExt = SRB_EXTENSION(Srb);
     srbControl = (PSRB_IO_CONTROL)SRB_DATA_BUFFER(Srb);
     dataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
-    if (dataLen < (sizeof(SRB_IO_CONTROL) + sizeof(FIRMWARE_REQUEST_BLOCK)))
+    if (!srbControl || dataLen < sizeof(*srbControl))
     {
-        srbControl->ReturnCode = FIRMWARE_STATUS_INVALID_PARAMETER;
         SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BAD_SRB_BLOCK_LENGTH);
-        RhelDbgPrint(TRACE_LEVEL_ERROR, " FirmwareRequest Bad Block Length  %ul\n", dataLen);
+        return;
+    }
+    srbControl->ReturnCode = FIRMWARE_STATUS_INVALID_PARAMETER;
+    SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BAD_SRB_BLOCK_LENGTH);
+    if (dataLen < sizeof(*srbControl) + sizeof(*firmwareRequest))
+    {
         return;
     }
 
     firmwareRequest = (PFIRMWARE_REQUEST_BLOCK)(srbControl + 1);
+    if (firmwareRequest->DataBufferOffset < sizeof(*srbControl) + sizeof(*firmwareRequest) ||
+        firmwareRequest->DataBufferOffset > dataLen ||
+        firmwareRequest->DataBufferLength > dataLen - firmwareRequest->DataBufferOffset ||
+        (firmwareRequest->DataBufferOffset & (sizeof(PVOID) - 1)))
+    {
+        return;
+    }
     switch (firmwareRequest->Function)
     {
 
         case FIRMWARE_FUNCTION_GET_INFO:
             {
                 PSTORAGE_FIRMWARE_INFO_V2 firmwareInfo;
-                // WHY NT_VERIFY + bugcheck: DataBufferOffset is caller-supplied (via the
-                // firmware IOCTL payload) and used below to form a pointer into the SRB data
-                // buffer with no proof that DataBufferOffset + sizeof(STORAGE_FIRMWARE_INFO_V2)
-                // actually fits inside dataLen. A malformed/malicious offset causes an
-                // out-of-bounds kernel read/write at an attacker-chosen offset. Known bug, not
-                // yet fixed - this proves when it's actually hit rather than corrupting
-                // memory silently.
-                if (!NT_VERIFY((ULONGLONG)firmwareRequest->DataBufferOffset + sizeof(STORAGE_FIRMWARE_INFO_V2) <= dataLen))
+                if (firmwareRequest->DataBufferLength < sizeof(STORAGE_FIRMWARE_INFO_V2))
                 {
-                    KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
-                                __LINE__,
-                                firmwareRequest->DataBufferOffset,
-                                dataLen,
-                                (ULONG_PTR)Srb);
+                    return;
                 }
                 firmwareInfo = (PSTORAGE_FIRMWARE_INFO_V2)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
                 RhelDbgPrint(TRACE_LEVEL_INFORMATION, " FIRMWARE_FUNCTION_GET_INFO \n");
-                if ((firmwareInfo->Version >= STORAGE_FIRMWARE_INFO_STRUCTURE_VERSION_V2) ||
-                    (firmwareInfo->Size >= sizeof(STORAGE_FIRMWARE_INFO_V2)))
+                if ((firmwareInfo->Version >= STORAGE_FIRMWARE_INFO_STRUCTURE_VERSION_V2) &&
+                    (firmwareInfo->Size >= sizeof(STORAGE_FIRMWARE_INFO_V2)) &&
+                    (firmwareInfo->Size <= firmwareRequest->DataBufferLength))
                 {
                     firmwareInfo->Version = STORAGE_FIRMWARE_INFO_STRUCTURE_VERSION_V2;
                     firmwareInfo->Size = sizeof(STORAGE_FIRMWARE_INFO_V2);
@@ -716,8 +654,9 @@ VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                     firmwareInfo->ImagePayloadMaxSize = PAGE_SIZE;
 
                     if (firmwareRequest->DataBufferLength >=
-                        (sizeof(STORAGE_FIRMWARE_INFO_V2) + sizeof(STORAGE_FIRMWARE_SLOT_INFO_V2)))
+                        (FIELD_OFFSET(STORAGE_FIRMWARE_INFO_V2, Slot) + sizeof(STORAGE_FIRMWARE_SLOT_INFO_V2)))
                     {
+                        RtlZeroMemory(&firmwareInfo->Slot[0], sizeof(firmwareInfo->Slot[0]));
                         firmwareInfo->Slot[0].SlotNumber = 0;
                         firmwareInfo->Slot[0].ReadOnly = FALSE;
                         StorPortCopyMemory(&firmwareInfo->Slot[0].Revision,
@@ -727,7 +666,7 @@ VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                     }
                     else
                     {
-                        firmwareRequest->DataBufferLength = sizeof(STORAGE_FIRMWARE_INFO_V2) +
+                        firmwareRequest->DataBufferLength = FIELD_OFFSET(STORAGE_FIRMWARE_INFO_V2, Slot) +
                                                             sizeof(STORAGE_FIRMWARE_SLOT_INFO_V2);
                         srbControl->ReturnCode = FIRMWARE_STATUS_OUTPUT_BUFFER_TOO_SMALL;
                     }
@@ -747,20 +686,15 @@ VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         case FIRMWARE_FUNCTION_DOWNLOAD:
             {
                 PSTORAGE_FIRMWARE_DOWNLOAD_V2 firmwareDwnld;
-                // WHY NT_VERIFY + bugcheck: see FIRMWARE_FUNCTION_GET_INFO above - same
-                // unchecked caller-supplied offset, same out-of-bounds risk.
-                if (!NT_VERIFY((ULONGLONG)firmwareRequest->DataBufferOffset + sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2) <= dataLen))
+                if (firmwareRequest->DataBufferLength < sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2))
                 {
-                    KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
-                                __LINE__,
-                                firmwareRequest->DataBufferOffset,
-                                dataLen,
-                                (ULONG_PTR)Srb);
+                    return;
                 }
                 firmwareDwnld = (PSTORAGE_FIRMWARE_DOWNLOAD_V2)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
                 RhelDbgPrint(TRACE_LEVEL_INFORMATION, " FIRMWARE_FUNCTION_DOWNLOAD \n");
-                if ((firmwareDwnld->Version >= STORAGE_FIRMWARE_DOWNLOAD_STRUCTURE_VERSION_V2) ||
-                    (firmwareDwnld->Size >= sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2)))
+                if ((firmwareDwnld->Version >= STORAGE_FIRMWARE_DOWNLOAD_STRUCTURE_VERSION_V2) &&
+                    (firmwareDwnld->Size >= sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2)) &&
+                    (firmwareDwnld->Size <= firmwareRequest->DataBufferLength))
                 {
                     firmwareDwnld->Version = STORAGE_FIRMWARE_DOWNLOAD_STRUCTURE_VERSION_V2;
                     firmwareDwnld->Size = sizeof(STORAGE_FIRMWARE_DOWNLOAD_V2);
@@ -782,19 +716,14 @@ VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         case FIRMWARE_FUNCTION_ACTIVATE:
             {
                 PSTORAGE_FIRMWARE_ACTIVATE firmwareActivate;
-                // WHY NT_VERIFY + bugcheck: see FIRMWARE_FUNCTION_GET_INFO above - same
-                // unchecked caller-supplied offset, same out-of-bounds risk.
-                if (!NT_VERIFY((ULONGLONG)firmwareRequest->DataBufferOffset + sizeof(STORAGE_FIRMWARE_ACTIVATE) <= dataLen))
+                if (firmwareRequest->DataBufferLength < sizeof(STORAGE_FIRMWARE_ACTIVATE))
                 {
-                    KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD,
-                                __LINE__,
-                                firmwareRequest->DataBufferOffset,
-                                dataLen,
-                                (ULONG_PTR)Srb);
+                    return;
                 }
                 firmwareActivate = (PSTORAGE_FIRMWARE_ACTIVATE)((PUCHAR)srbControl + firmwareRequest->DataBufferOffset);
-                if ((firmwareActivate->Version == STORAGE_FIRMWARE_ACTIVATE_STRUCTURE_VERSION) ||
-                    (firmwareActivate->Size >= sizeof(STORAGE_FIRMWARE_ACTIVATE)))
+                if ((firmwareActivate->Version == STORAGE_FIRMWARE_ACTIVATE_STRUCTURE_VERSION) &&
+                    (firmwareActivate->Size >= sizeof(STORAGE_FIRMWARE_ACTIVATE)) &&
+                    (firmwareActivate->Size <= firmwareRequest->DataBufferLength))
                 {
                     firmwareActivate->Version = STORAGE_FIRMWARE_ACTIVATE_STRUCTURE_VERSION;
                     firmwareActivate->Size = sizeof(STORAGE_FIRMWARE_ACTIVATE);

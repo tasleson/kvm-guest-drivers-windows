@@ -261,13 +261,13 @@ typedef struct _SRB_EXTENSION
     VRING_DESC_ALIAS desc_alias[VIRTIO_MAX_SG];
     ULONGLONG time;
     ULONG_PTR id;
+    UCHAR completion_status;
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
 
 #pragma pack(1)
 typedef struct
 {
-    SCSI_REQUEST_BLOCK Srb;
     PSRB_EXTENSION SrbExtension;
 } TMF_COMMAND, *PTMF_COMMAND;
 #pragma pack()
@@ -278,16 +278,6 @@ typedef struct _REQUEST_LIST
     ULONG srb_cnt;
     ULONG_PTR next_id;
 } REQUEST_LIST, *PREQUEST_LIST;
-
-//
-// Bugcheck code for the NT_VERIFY corruption guards below. These are deliberately
-// fatal rather than recovered from: this driver is currently being run under
-// hypervisor-driven error injection to find where it silently corrupts memory
-// today, so any such invariant violation should stop the VM immediately and
-// visibly rather than being quietly routed around. Distinct from 0xDEADDEAD,
-// which is the pre-existing manually-triggered test path (VioscsiResetBugCheck).
-//
-#define VIOSCSI_BUGCHECK_CORRUPTION_GUARD 0xBAADC0DE
 
 typedef struct virtio_bar
 {
@@ -315,6 +305,7 @@ typedef struct _ADAPTER_EXTENSION
     PVOID poolAllocationVa;
     ULONG poolAllocationSize;
     ULONG poolOffset;
+    ULONG queuePoolOffset;
 
     struct virtqueue *vq[VIRTIO_SCSI_QUEUE_LAST];
     ULONG_PTR device_base;
@@ -338,8 +329,7 @@ typedef struct _ADAPTER_EXTENSION
     BOOLEAN indirect;
 
     TMF_COMMAND tmf_cmd;
-    // TRUE while tmf_cmd is owned by DeviceReset or the device. Only modify it with
-    // Interlocked* operations, see DeviceReset.
+    // Claimed under all interrupt locks; released by the control-queue ISR.
     volatile LONG tmf_infly;
 
     PVirtIOSCSIEventNode events;
@@ -354,14 +344,14 @@ typedef struct _ADAPTER_EXTENSION
     ULONG max_physical_breaks;
     SCSI_WMILIB_CONTEXT WmiLibContext;
     ULONGLONG hba_id;
-    PUCHAR ser_num;
+    UCHAR ser_num[65];
     ULONGLONG wwn;
     ULONGLONG port_wwn;
     ULONG port_idx;
     UCHAR ven_id[8 + 1];
     UCHAR prod_id[16 + 1];
     UCHAR rev_id[4 + 1];
-    BOOLEAN reset_in_progress;
+    UCHAR removed_luns[256][256 / 8];
     ACTION_ON_RESET action_on_reset;
     ULONGLONG fw_ver;
     ULONG resp_time;
