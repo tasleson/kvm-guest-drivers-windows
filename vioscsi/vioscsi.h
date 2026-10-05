@@ -33,6 +33,7 @@
 
 #include <ntddk.h>
 #include <storport.h>
+#include <ntddscsi.h>
 #include "scsiwmi.h"
 
 #include "osdep.h"
@@ -261,7 +262,9 @@ typedef struct _SRB_EXTENSION
     VRING_DESC_ALIAS desc_alias[VIRTIO_MAX_SG];
     ULONGLONG time;
     ULONG_PTR id;
-    ULONG QueueIndex; // index into ADAPTER_EXTENSION.processing_srbs / Telemetry.Queues, set by SendSRB
+    ULONG QueueIndex;     // index into ADAPTER_EXTENSION.processing_srbs / Telemetry.Queues, set by SendSRB
+    ULONGLONG SubmitTime; // StorPerfInterruptTime() when queued, 0 if never submitted; feeds OldestInFlightTime
+    ULONG TargetId;       // SRB_TARGET_ID, set by VioScsiBuildIo; indexes Telemetry.Targets (bounds-checked there)
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
 
@@ -295,26 +298,54 @@ typedef struct _REQUEST_LIST
 // extension so it is present in a crash dump without any extra plumbing.
 //
 // The block is self-describing so that a snapshot (IOCTL), an offline tool or
-// a debugger script can interpret it without an exact struct-layout match:
+// a debugger script can interpret it without an exact struct-layout match. In
+// the adapter extension (what a debugger reads from memory) it is
 //
-//   [ header + adapter-wide fields ][ Queues[0] ] ... [ Queues[QueueCount-1] ]
-//   |<-------- HeaderSize -------->|<- QueueSize ->|
+//   [ header + adapter-wide ][ Queues[0..MAX_CPU-1] ][ Targets[0..MAX_TARGETS-1] ]
+//   |<----- HeaderSize ----->|<-- QueueSize each -->|<-- TargetSize each ------->|
 //
-// Queues[] is deliberately the last member so that the first
-// HeaderSize + QueueCount * QueueSize bytes are a complete compact snapshot.
-// Layout rules:
-//   - Magic..Reserved never move.
-//   - New adapter-wide fields are appended after the last adapter-wide field
-//     (growing HeaderSize); new per-queue fields are appended to the end of
-//     QUEUE_TELEMETRY (growing QueueSize). Never reorder or remove fields.
+// with only the first QueueCount queues valid and Targets[] indexed by SCSI target ID
+// (TargetCount == STOR_TELEMETRY_MAX_TARGETS, each entry's TargetId == its index). The IOCTL
+// snapshot is compact instead:
+//
+//   [ header ][ Queues[0..QueueCount-1] ][ active targets only, in ID order ]
+//
+// with TargetCount and TargetsOffset in the header rewritten to describe what was sent, and
+// TargetId in each entry saying which target it is. A reader therefore never assumes
+// "index == target ID": it takes TargetsOffset/TargetSize/TargetCount from the header and the
+// ID from the entry. Layout rules:
+//   - HeaderSize, QueueSize, QueueCount, TargetSize, TargetCount come first so the first
+//     7 * sizeof(ULONG) bytes are enough to size a retry after a truncated IOCTL.
+//   - New adapter-wide fields are appended after the last adapter-wide field (growing
+//     HeaderSize); new per-queue/per-target fields are appended to QUEUE_TELEMETRY/
+//     TARGET_TELEMETRY (growing QueueSize/TargetSize).
 //   - Keep every field naturally aligned with explicit padding, so the layout
 //     is identical on x86 and x64 and parsers need no ABI knowledge.
 //   - Bump STOR_TELEMETRY_VERSION on any change.
 //
+// Timestamps (OldestInFlightTime, LastCompletionTime, MaxLatencyTime, LastResetTime,
+// SnapshotTime, TargetScanTime) are system interrupt time in 100 ns units (KeQueryInterruptTime),
+// 0 meaning "never/none". That clock is a single shared counter that a debugger can also read from
+// KUSER_SHARED_DATA in a kernel dump, so "how long ago" can be computed after the fact
+// (against SnapshotTime for a live IOCTL snapshot, the dump-time interrupt time otherwise).
+// The per-request latency counters keep using the Storport performance counter.
+//
 #define STOR_TELEMETRY_MAGIC              0x53505331 // 'SPS1'
-#define STOR_TELEMETRY_VERSION            3
+#define STOR_TELEMETRY_VERSION            5
 #define STOR_TELEMETRY_HISTOGRAM_BUCKETS  64
 #define STOR_TELEMETRY_STATUS_SLOTS       64
+
+// SRB_TARGET_ID is a UCHAR, so 256 entries cover every value an SRB can carry without a range
+// check being load-bearing (ConfigInfo->MaximumNumberOfTargets is capped at 255, i.e. IDs 0..254
+// are real). Every index is still checked through StorPerfTarget().
+#define STOR_TELEMETRY_MAX_TARGETS        256
+
+// Requests slower than these are counted in QUEUE_TELEMETRY/TARGET_TELEMETRY.Slow*Count (each count
+// includes the slower ones too: a 40 s request is in all three). A request that never completes
+// shows up in OldestInFlightTime instead.
+#define STOR_TELEMETRY_SLOW_1S_US         1000000ULL
+#define STOR_TELEMETRY_SLOW_5S_US         5000000ULL
+#define STOR_TELEMETRY_SLOW_30S_US        30000000ULL
 
 typedef struct _LATENCY_STATS
 {
@@ -325,6 +356,8 @@ typedef struct _LATENCY_STATS
     ULONG64 MaxUs;
 } LATENCY_STATS, *PLATENCY_STATS;
 
+// Per-queue counters are read without a lock by TelemetryRequest, so the 64-bit tearing noted
+// there applies to all of them on x86.
 typedef struct _QUEUE_TELEMETRY
 {
     ULONG64 ReadCount;
@@ -339,19 +372,83 @@ typedef struct _QUEUE_TELEMETRY
     ULONG InFlightHighWaterMark;
     ULONG Reserved;         // explicit padding, keeps QueueFullCount 8-byte aligned on x86 too
     ULONG64 QueueFullCount; // virtqueue_add_buf() had no free descriptors
+
+    // OldestInFlightTime comes from SRB_EXTENSION.SubmitTime, which is stamped after the latency
+    // clock (SRB_EXTENSION.time), so it can read slightly younger than the latency of a slow request.
+    ULONG64 OldestInFlightTime; // SubmitTime of the oldest request still on the virtqueue, 0 if none
+    ULONG64 LastCompletionTime; // when the last request completed on this queue
+    ULONG64 MaxLatencyTime;     // when Latency.MaxUs was last raised
+    ULONG64 Slow1sCount;        // completions slower than STOR_TELEMETRY_SLOW_1S_US
+    ULONG64 Slow5sCount;
+    ULONG64 Slow30sCount;
+    ULONG InFlightCount; // requests on the virtqueue now (InFlightHighWaterMark is the peak)
+    ULONG Reserved2;     // explicit padding, keeps sizeof(QUEUE_TELEMETRY) a multiple of 8
 } QUEUE_TELEMETRY, *PQUEUE_TELEMETRY;
+
+//
+// Per SCSI target (SRB_TARGET_ID), so that on an adapter with several targets a stall or error
+// storm can be pinned on one of them. A target's requests are spread over all queues, so these
+// are shared counters updated with interlocked operations rather than per-queue state.
+//
+// Everything is maintained on the I/O path except OldestInFlightTime: a target's oldest
+// outstanding request would need a cross-queue minimum that cannot be kept without a shared lock
+// (the per-queue request lists are ordered by submission within one queue only). TelemetryRequest
+// instead recomputes it for every target in one pass over the request lists, taking each queue's
+// lock in turn, and publishes it with TargetScanTime. It is therefore exact at the moment of an
+// IOCTL snapshot and, in a crash dump, only as fresh as the last snapshot (0 TargetScanTime means
+// never: use InFlightCount together with LastCompletionTime to spot a stalled target instead).
+//
+// Latency, slow-request and LastCompletionTime state only count requests that were actually
+// queued to the device (SRB_EXTENSION.SubmitTime != 0), as for QUEUE_TELEMETRY. The request,
+// byte and error counters count every completion, including those made without the device, since
+// they record what the initiator was told.
+//
+typedef struct _TARGET_TELEMETRY
+{
+    ULONG TargetId;      // SCSI target ID this entry describes
+    ULONG InFlightCount; // requests on a virtqueue for this target now, over all queues
+
+    ULONG64 ReadCount;
+    ULONG64 WriteCount;
+    ULONG64 OtherCount; // everything else: flush, unmap, inquiry, ...
+    ULONG64 ReadBytes;
+    ULONG64 WriteBytes;
+
+    ULONG64 OldestInFlightTime; // SubmitTime of the oldest outstanding request as of TargetScanTime, 0 if none
+    ULONG64 LastCompletionTime; // when the last device completion happened for this target
+    ULONG64 LatencyCount;       // device completions measured
+    ULONG64 LatencySumUs;
+    ULONG64 MaxLatencyUs;
+    ULONG64 MaxLatencyTime; // when MaxLatencyUs was last raised
+    ULONG64 Slow1sCount;
+    ULONG64 Slow5sCount;
+    ULONG64 Slow30sCount;
+
+    ULONG64 BusyCount;          // SRB_STATUS_BUSY (device busy or queue full)
+    ULONG64 AbortedCount;       // SRB_STATUS_ABORTED / SRB_STATUS_BUS_RESET
+    ULONG64 NoDeviceCount;      // SRB_STATUS_NO_DEVICE, including requests refused by VioScsiBuildIo
+    ULONG64 ErrorCount;         // SRB_STATUS_ERROR (check condition, transport/target/nexus failure, ...)
+    ULONG64 InvalidTargetCount; // SRB_STATUS_INVALID_TARGET_ID, i.e. the device answered BAD_TARGET
+
+    ULONG64 DeviceResetCount; // SRB_FUNCTION_RESET_DEVICE addressed to this target
+    ULONG64 LogicalUnitResetCount;
+    ULONG64 LastResetTime; // when the last of those two arrived
+} TARGET_TELEMETRY, *PTARGET_TELEMETRY;
 
 typedef struct _STOR_TELEMETRY
 {
     // Header, see layout rules above.
     ULONG Magic;
     ULONG Version;
-    ULONG HeaderSize;     // FIELD_OFFSET(STOR_TELEMETRY, Queues)
+    ULONG HeaderSize;     // FIELD_OFFSET(STOR_TELEMETRY, Queues), also the offset of the queue table
     ULONG QueueSize;      // sizeof(QUEUE_TELEMETRY)
     ULONG QueueCount;     // number of valid Queues[] entries, == ADAPTER_EXTENSION.num_queues
+    ULONG TargetSize;     // sizeof(TARGET_TELEMETRY)
+    ULONG TargetCount;    // entries in the target table: STOR_TELEMETRY_MAX_TARGETS in memory, the active count in a snapshot
+    ULONG TargetsOffset;  // byte offset of the target table from the start of the block/snapshot
     ULONG LatencyBuckets; // STOR_TELEMETRY_HISTOGRAM_BUCKETS
     ULONG StatusSlots;    // STOR_TELEMETRY_STATUS_SLOTS
-    ULONG Reserved;
+    ULONG Reserved[2];
 
     // Adapter-wide: resets aren't a per-queue event.
     ULONG64 BusResetCount;
@@ -360,27 +457,46 @@ typedef struct _STOR_TELEMETRY
     ULONG64 LastResetDurationUs;
     ULONG64 MaxResetDurationUs;
     ULONG64 DeviceResetTmfInFlightCount; // DeviceReset() entered while a TMF was already in flight
+    ULONG64 LastResetTime;               // when the last bus/device/LUN reset request arrived
+    ULONG64 SnapshotTime;                // when the last IOCTL snapshot was taken, the "now" for live ages
+    ULONG64 OutOfRangeTargetCount;       // requests VioScsiBuildIo refused for a target ID the device doesn't have
+    ULONG64 TargetScanTime;              // when Targets[].OldestInFlightTime was last computed, 0 never
 
-    // Must remain the last member.
     QUEUE_TELEMETRY Queues[MAX_CPU];
+    TARGET_TELEMETRY Targets[STOR_TELEMETRY_MAX_TARGETS]; // must remain the last member
 } STOR_TELEMETRY, *PSTOR_TELEMETRY;
 
 C_ASSERT(sizeof(LATENCY_STATS) % sizeof(ULONG64) == 0);
 C_ASSERT(sizeof(QUEUE_TELEMETRY) % sizeof(ULONG64) == 0);
 C_ASSERT(FIELD_OFFSET(QUEUE_TELEMETRY, QueueFullCount) % sizeof(ULONG64) == 0);
-C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, BusResetCount) == 8 * sizeof(ULONG));
+C_ASSERT(FIELD_OFFSET(QUEUE_TELEMETRY, OldestInFlightTime) ==
+         FIELD_OFFSET(QUEUE_TELEMETRY, QueueFullCount) + sizeof(ULONG64));
+C_ASSERT(FIELD_OFFSET(QUEUE_TELEMETRY, InFlightCount) == FIELD_OFFSET(QUEUE_TELEMETRY, Slow30sCount) + sizeof(ULONG64));
+C_ASSERT(sizeof(TARGET_TELEMETRY) % sizeof(ULONG64) == 0);
+C_ASSERT(FIELD_OFFSET(TARGET_TELEMETRY, ReadCount) == 2 * sizeof(ULONG));
+C_ASSERT(sizeof(TARGET_TELEMETRY) == 184);
+C_ASSERT(STOR_TELEMETRY_MAX_TARGETS > MAXUCHAR);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, TargetCount) == 6 * sizeof(ULONG));
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, BusResetCount) == 12 * sizeof(ULONG));
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, LastResetTime) == 96);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, SnapshotTime) == 104);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, TargetScanTime) == 120);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) == 128);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) % sizeof(ULONG64) == 0);
-C_ASSERT(sizeof(STOR_TELEMETRY) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CPU * sizeof(QUEUE_TELEMETRY));
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Targets) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CPU * sizeof(QUEUE_TELEMETRY));
+C_ASSERT(sizeof(STOR_TELEMETRY) ==
+         FIELD_OFFSET(STOR_TELEMETRY, Targets) + STOR_TELEMETRY_MAX_TARGETS * sizeof(TARGET_TELEMETRY));
 
 //
-// IOCTL_SCSI_MINIPORT request returning a compact snapshot of STOR_TELEMETRY:
+// IOCTL_SCSI_MINIPORT request returning a compact snapshot of STOR_TELEMETRY (header, the
+// valid queues, then only the targets that have seen any activity, see the layout above):
 // SRB_IO_CONTROL.Signature must be VIOSCSI_IOCTL_SIGNATURE (8 bytes including
 // the NUL) and ControlCode VIOSCSI_IOCTL_QUERY_TELEMETRY. The driver copies
-// the first min(Length, HeaderSize + QueueCount * QueueSize) bytes of the live
-// block into the payload and sets Length to the number of bytes copied.
-// ReturnCode is VIOSCSI_TELEMETRY_RC_TRUNCATED when that is less than the full
-// snapshot; a caller can learn the full size from the header (the first 20
-// bytes hold HeaderSize/QueueSize/QueueCount) and retry with a larger buffer.
+// the first min(Length, snapshot size) bytes of the snapshot into the payload and sets
+// Length to the number of bytes copied. ReturnCode is VIOSCSI_TELEMETRY_RC_TRUNCATED when that
+// is less than the full snapshot; a caller can learn the full size from the header (the first
+// 28 bytes hold HeaderSize/QueueSize/QueueCount/TargetSize/TargetCount) and retry with a larger
+// buffer. The active target set can change between calls, so a retry may need to grow again.
 // Tools/debug/GetVioScsiTelemetry.ps1 mirrors these values.
 //
 #define VIOSCSI_IOCTL_SIGNATURE        "VIOSCSI"
@@ -420,7 +536,7 @@ StorPerfUpdateMin(IN OUT PULONG64 Target, IN ULONG64 Value)
     }
 }
 
-FORCEINLINE VOID
+FORCEINLINE BOOLEAN
 StorPerfUpdateMax(IN OUT PULONG64 Target, IN ULONG64 Value)
 {
     ULONG64 current = *Target;
@@ -429,10 +545,72 @@ StorPerfUpdateMax(IN OUT PULONG64 Target, IN ULONG64 Value)
         ULONG64 prior = (ULONG64)InterlockedCompareExchange64((PLONG64)Target, (LONG64)Value, (LONG64)current);
         if (prior == current)
         {
-            return;
+            return TRUE;
         }
         current = prior;
     }
+    return FALSE;
+}
+
+// Republishes a queue's in-flight count and oldest submit time from its request list.
+// Requests are appended to srb_list in submission order, so the head is the oldest. Call with
+// the queue's VioScsiVQLock held after any change to srb_list/srb_cnt.
+FORCEINLINE VOID
+StorPerfSyncInFlight(IN OUT PQUEUE_TELEMETRY QueueStats, IN PREQUEST_LIST Element)
+{
+    QueueStats->InFlightCount = Element->srb_cnt;
+    if (IsListEmpty(&Element->srb_list))
+    {
+        QueueStats->OldestInFlightTime = 0;
+    }
+    else
+    {
+        PSRB_EXTENSION oldest = CONTAINING_RECORD(Element->srb_list.Flink, SRB_EXTENSION, list_entry);
+
+        QueueStats->OldestInFlightTime = oldest->SubmitTime;
+    }
+}
+
+// The telemetry entry for a SCSI target ID, or NULL if the ID is outside the table. All
+// per-target updates go through this so a bogus ID in an SRB can never index out of bounds.
+FORCEINLINE PTARGET_TELEMETRY
+StorPerfTarget(IN OUT PSTOR_TELEMETRY Telemetry, IN ULONG TargetId)
+{
+    return (TargetId < STOR_TELEMETRY_MAX_TARGETS) ? &Telemetry->Targets[TargetId] : NULL;
+}
+
+// A request was added to a virtqueue / removed from its request list (completed, aborted by a
+// reset or unit removal). Call under the queue's VioScsiVQLock next to the srb_list change, so the
+// per-target count always matches the lists the snapshot scan walks.
+FORCEINLINE VOID
+StorPerfTargetSubmitted(IN OUT PSTOR_TELEMETRY Telemetry, IN PSRB_EXTENSION SrbExt)
+{
+    PTARGET_TELEMETRY target = StorPerfTarget(Telemetry, SrbExt->TargetId);
+
+    if (target != NULL)
+    {
+        InterlockedIncrement((PLONG)&target->InFlightCount);
+    }
+}
+
+FORCEINLINE VOID
+StorPerfTargetRemoved(IN OUT PSTOR_TELEMETRY Telemetry, IN PSRB_EXTENSION SrbExt)
+{
+    PTARGET_TELEMETRY target = StorPerfTarget(Telemetry, SrbExt->TargetId);
+
+    if (target != NULL)
+    {
+        InterlockedDecrement((PLONG)&target->InFlightCount);
+    }
+}
+
+// True for a target that has seen anything worth reporting, which is what the IOCTL snapshot
+// includes and what the tools show by default.
+FORCEINLINE BOOLEAN
+StorPerfTargetActive(IN PTARGET_TELEMETRY Target)
+{
+    return (Target->InFlightCount | Target->ReadCount | Target->WriteCount | Target->OtherCount | Target->NoDeviceCount |
+            Target->DeviceResetCount | Target->LogicalUnitResetCount) != 0;
 }
 
 typedef struct virtio_bar
@@ -512,6 +690,14 @@ typedef struct _ADAPTER_EXTENSION
     BOOLEAN bRemoved;
     STOR_TELEMETRY Telemetry;
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
+
+// Current time for telemetry timestamps (see the STOR_TELEMETRY timestamp notes). Returns 0
+// in crash dump mode, where the dump environment may not provide kernel time services.
+FORCEINLINE ULONGLONG
+StorPerfInterruptTime(IN PADAPTER_EXTENSION adaptExt)
+{
+    return adaptExt->dump_mode ? 0 : KeQueryInterruptTime();
+}
 
 //
 // Started (non-dump) adapters are listed in the global VioScsiTelemetryDirectory so a
