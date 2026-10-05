@@ -1418,6 +1418,7 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
                                          SRB_LUN(currSrb));
                             RemoveEntryList(entry);
                             element->srb_cnt--;
+                            StorPerfSyncInFlight(&adaptExt->Telemetry.Queues[index], element);
                         }
                         entry = next;
                     }
@@ -1636,6 +1637,7 @@ VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr)
                     RemoveEntryList(le);
                     bFound = TRUE;
                     element->srb_cnt--;
+                    StorPerfSyncInFlight(&adaptExt->Telemetry.Queues[index - VIRTIO_SCSI_REQUEST_QUEUE_0], element);
                     break;
                 }
             }
@@ -1709,6 +1711,7 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
             {
                 element->srb_cnt = 0;
             }
+            StorPerfSyncInFlight(&adaptExt->Telemetry.Queues[index], element);
             VioScsiVQUnlock(DeviceExtension, MsgId, &LockHandle, FALSE);
         }
         StorPortResume(DeviceExtension);
@@ -1813,6 +1816,7 @@ PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                     InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.LogicalUnitResetCount);
                     break;
             }
+            InterlockedExchange64((PLONG64)&adaptExt->Telemetry.LastResetTime, (LONG64)StorPerfNow(adaptExt));
 
             switch (adaptExt->action_on_reset)
             {
@@ -1928,6 +1932,7 @@ RecordIoCompletionStats(IN PADAPTER_EXTENSION adaptExt, IN PSRB_TYPE Srb, IN PSR
     UCHAR srbStatus;
     UCHAR statusIndex;
     ULONG bucket;
+    ULONGLONG now;
 
     if (SRB_FUNCTION(Srb) != SRB_FUNCTION_EXECUTE_SCSI || srbExt->QueueIndex >= adaptExt->num_queues)
     {
@@ -1942,7 +1947,24 @@ RecordIoCompletionStats(IN PADAPTER_EXTENSION adaptExt, IN PSRB_TYPE Srb, IN PSR
     InterlockedIncrement64((PLONG64)&queueStats->Latency.Count);
     InterlockedExchangeAdd64((PLONG64)&queueStats->Latency.SumUs, (LONG64)ElapsedUs);
     StorPerfUpdateMin(&queueStats->Latency.MinUs, ElapsedUs);
-    StorPerfUpdateMax(&queueStats->Latency.MaxUs, ElapsedUs);
+    now = StorPerfNow(adaptExt);
+    if (StorPerfUpdateMax(&queueStats->Latency.MaxUs, ElapsedUs))
+    {
+        InterlockedExchange64((PLONG64)&queueStats->MaxLatencyTime, (LONG64)now);
+    }
+    InterlockedExchange64((PLONG64)&queueStats->LastCompletionTime, (LONG64)now);
+    if (ElapsedUs > STOR_TELEMETRY_SLOW_1S_US)
+    {
+        InterlockedIncrement64((PLONG64)&queueStats->Slow1sCount);
+        if (ElapsedUs > STOR_TELEMETRY_SLOW_5S_US)
+        {
+            InterlockedIncrement64((PLONG64)&queueStats->Slow5sCount);
+            if (ElapsedUs > STOR_TELEMETRY_SLOW_30S_US)
+            {
+                InterlockedIncrement64((PLONG64)&queueStats->Slow30sCount);
+            }
+        }
+    }
 
     srbStatus = SrbGetSrbStatus(Srb);
     statusIndex = srbStatus & ~(SRB_STATUS_QUEUE_FROZEN | SRB_STATUS_AUTOSENSE_VALID);
@@ -2233,6 +2255,8 @@ static VOID TelemetryRequest(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
     queueCount = min(adaptExt->Telemetry.QueueCount, MAX_CPU);
     snapshotLen = (ULONG)FIELD_OFFSET(STOR_TELEMETRY, Queues) + queueCount * (ULONG)sizeof(QUEUE_TELEMETRY);
     copyLen = min(srbControl->Length, snapshotLen);
+
+    InterlockedExchange64((PLONG64)&adaptExt->Telemetry.SnapshotTime, (LONG64)StorPerfNow(adaptExt));
 
     // No lock: counters are updated with interlocked operations, so the snapshot is not
     // a consistent point-in-time view across fields (and on 32-bit builds an individual

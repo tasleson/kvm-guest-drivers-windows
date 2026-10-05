@@ -33,6 +33,7 @@
 
 #include <ntddk.h>
 #include <storport.h>
+#include <ntddscsi.h>
 #include "scsiwmi.h"
 
 #include "osdep.h"
@@ -261,7 +262,8 @@ typedef struct _SRB_EXTENSION
     VRING_DESC_ALIAS desc_alias[VIRTIO_MAX_SG];
     ULONGLONG time;
     ULONG_PTR id;
-    ULONG QueueIndex; // index into ADAPTER_EXTENSION.processing_srbs / Telemetry.Queues, set by SendSRB
+    ULONG QueueIndex;     // index into ADAPTER_EXTENSION.processing_srbs / Telemetry.Queues, set by SendSRB
+    ULONGLONG SubmitTime; // StorPerfNow() when queued to the virtqueue, 0 if unknown; feeds OldestInFlightTime
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
 
@@ -311,10 +313,24 @@ typedef struct _REQUEST_LIST
 //     is identical on x86 and x64 and parsers need no ABI knowledge.
 //   - Bump STOR_TELEMETRY_VERSION on any change.
 //
+// Timestamps (OldestInFlightTime, LastCompletionTime, MaxLatencyTime, LastResetTime,
+// SnapshotTime) are system interrupt time in 100 ns units (KeQueryInterruptTime), 0 meaning
+// "never/none". That clock is a single shared counter that a debugger can also read from
+// KUSER_SHARED_DATA in a kernel dump, so "how long ago" can be computed after the fact
+// (against SnapshotTime for a live IOCTL snapshot, the dump-time interrupt time otherwise).
+// The per-request latency counters keep using the Storport performance counter.
+//
 #define STOR_TELEMETRY_MAGIC              0x53505331 // 'SPS1'
-#define STOR_TELEMETRY_VERSION            3
+#define STOR_TELEMETRY_VERSION            4
 #define STOR_TELEMETRY_HISTOGRAM_BUCKETS  64
 #define STOR_TELEMETRY_STATUS_SLOTS       64
+
+// Requests slower than these are counted in QUEUE_TELEMETRY.Slow*Count (each count includes
+// the slower ones too: a 40 s request is in all three). A request that never completes shows
+// up in OldestInFlightTime instead.
+#define STOR_TELEMETRY_SLOW_1S_US         1000000ULL
+#define STOR_TELEMETRY_SLOW_5S_US         5000000ULL
+#define STOR_TELEMETRY_SLOW_30S_US        30000000ULL
 
 typedef struct _LATENCY_STATS
 {
@@ -339,6 +355,16 @@ typedef struct _QUEUE_TELEMETRY
     ULONG InFlightHighWaterMark;
     ULONG Reserved;         // explicit padding, keeps QueueFullCount 8-byte aligned on x86 too
     ULONG64 QueueFullCount; // virtqueue_add_buf() had no free descriptors
+
+    // Added in version 4.
+    ULONG64 OldestInFlightTime; // SubmitTime of the oldest request still on the virtqueue, 0 if none
+    ULONG64 LastCompletionTime; // when the last request completed on this queue
+    ULONG64 MaxLatencyTime;     // when Latency.MaxUs was last raised
+    ULONG64 Slow1sCount;        // completions slower than STOR_TELEMETRY_SLOW_1S_US
+    ULONG64 Slow5sCount;
+    ULONG64 Slow30sCount;
+    ULONG InFlightCount; // requests on the virtqueue now (InFlightHighWaterMark is the peak)
+    ULONG Reserved2;     // explicit padding, keeps sizeof(QUEUE_TELEMETRY) a multiple of 8
 } QUEUE_TELEMETRY, *PQUEUE_TELEMETRY;
 
 typedef struct _STOR_TELEMETRY
@@ -361,6 +387,10 @@ typedef struct _STOR_TELEMETRY
     ULONG64 MaxResetDurationUs;
     ULONG64 DeviceResetTmfInFlightCount; // DeviceReset() entered while a TMF was already in flight
 
+    // Added in version 4.
+    ULONG64 LastResetTime; // when the last bus/device/LUN reset request arrived
+    ULONG64 SnapshotTime;  // when the last IOCTL snapshot was taken, the "now" for live ages
+
     // Must remain the last member.
     QUEUE_TELEMETRY Queues[MAX_CPU];
 } STOR_TELEMETRY, *PSTOR_TELEMETRY;
@@ -369,7 +399,12 @@ C_ASSERT(sizeof(LATENCY_STATS) % sizeof(ULONG64) == 0);
 C_ASSERT(sizeof(QUEUE_TELEMETRY) % sizeof(ULONG64) == 0);
 C_ASSERT(FIELD_OFFSET(QUEUE_TELEMETRY, QueueFullCount) % sizeof(ULONG64) == 0);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, BusResetCount) == 8 * sizeof(ULONG));
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, LastResetTime) == 80);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, SnapshotTime) == 88);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) % sizeof(ULONG64) == 0);
+C_ASSERT(FIELD_OFFSET(QUEUE_TELEMETRY, OldestInFlightTime) ==
+         FIELD_OFFSET(QUEUE_TELEMETRY, QueueFullCount) + sizeof(ULONG64));
+C_ASSERT(FIELD_OFFSET(QUEUE_TELEMETRY, InFlightCount) == FIELD_OFFSET(QUEUE_TELEMETRY, Slow30sCount) + sizeof(ULONG64));
 C_ASSERT(sizeof(STOR_TELEMETRY) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CPU * sizeof(QUEUE_TELEMETRY));
 
 //
@@ -420,7 +455,7 @@ StorPerfUpdateMin(IN OUT PULONG64 Target, IN ULONG64 Value)
     }
 }
 
-FORCEINLINE VOID
+FORCEINLINE BOOLEAN
 StorPerfUpdateMax(IN OUT PULONG64 Target, IN ULONG64 Value)
 {
     ULONG64 current = *Target;
@@ -429,9 +464,29 @@ StorPerfUpdateMax(IN OUT PULONG64 Target, IN ULONG64 Value)
         ULONG64 prior = (ULONG64)InterlockedCompareExchange64((PLONG64)Target, (LONG64)Value, (LONG64)current);
         if (prior == current)
         {
-            return;
+            return TRUE;
         }
         current = prior;
+    }
+    return FALSE;
+}
+
+// Republishes a queue's in-flight count and oldest submit time from its request list.
+// Requests are appended to srb_list in submission order, so the head is the oldest. Call with
+// the queue's VioScsiVQLock held after any change to srb_list/srb_cnt.
+FORCEINLINE VOID
+StorPerfSyncInFlight(IN OUT PQUEUE_TELEMETRY QueueStats, IN PREQUEST_LIST Element)
+{
+    QueueStats->InFlightCount = Element->srb_cnt;
+    if (IsListEmpty(&Element->srb_list))
+    {
+        QueueStats->OldestInFlightTime = 0;
+    }
+    else
+    {
+        PSRB_EXTENSION oldest = CONTAINING_RECORD(Element->srb_list.Flink, SRB_EXTENSION, list_entry);
+
+        QueueStats->OldestInFlightTime = oldest->SubmitTime;
     }
 }
 
@@ -512,6 +567,14 @@ typedef struct _ADAPTER_EXTENSION
     BOOLEAN bRemoved;
     STOR_TELEMETRY Telemetry;
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
+
+// Current time for telemetry timestamps (see the STOR_TELEMETRY timestamp notes). Returns 0
+// in crash dump mode, where the dump environment may not provide kernel time services.
+FORCEINLINE ULONGLONG
+StorPerfNow(IN PADAPTER_EXTENSION adaptExt)
+{
+    return adaptExt->dump_mode ? 0 : KeQueryInterruptTime();
+}
 
 //
 // Started (non-dump) adapters are listed in the global VioScsiTelemetryDirectory so a
