@@ -54,7 +54,19 @@
 #define VIOSCSI_MS_PORT_INFORM_GUID_INDEX    2
 
 BOOLEAN IsCrashDumpMode;
-PADAPTER_EXTENSION VioScsiTelemetryAdapters[VIOSCSI_MAX_TELEMETRY_ADAPTERS];
+// Statically initialized so it sits in the image's .data with the magic already in place.
+// clang-format off
+VIOSCSI_TELEMETRY_DIRECTORY VioScsiTelemetryDirectory =
+{
+    VIOSCSI_TELEMETRY_DIRECTORY_MAGIC,          // Magic
+    VIOSCSI_TELEMETRY_DIRECTORY_VERSION,        // Version
+    sizeof(PVOID),                              // PointerSize
+    VIOSCSI_MAX_TELEMETRY_ADAPTERS,             // MaxAdapters
+    FIELD_OFFSET(ADAPTER_EXTENSION, Telemetry), // TelemetryOffset
+    0,                                          // Reserved
+    { NULL },                                   // Adapters
+};
+// clang-format on
 
 sp_DRIVER_INITIALIZE DriverEntry;
 HW_INITIALIZE VioScsiHwInitialize;
@@ -664,14 +676,16 @@ static VOID TelemetryRegisterAdapter(IN PADAPTER_EXTENSION adaptExt)
     }
     for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
     {
-        if (VioScsiTelemetryAdapters[i] == adaptExt)
+        if (VioScsiTelemetryDirectory.Adapters[i] == adaptExt)
         {
             return;
         }
     }
     for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
     {
-        if (InterlockedCompareExchangePointer((PVOID volatile *)&VioScsiTelemetryAdapters[i], adaptExt, NULL) == NULL)
+        if (InterlockedCompareExchangePointer((PVOID volatile *)&VioScsiTelemetryDirectory.Adapters[i],
+                                              adaptExt,
+                                              NULL) == NULL)
         {
             return;
         }
@@ -685,7 +699,7 @@ static VOID TelemetryDeregisterAdapter(IN PADAPTER_EXTENSION adaptExt)
 
     for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
     {
-        InterlockedCompareExchangePointer((PVOID volatile *)&VioScsiTelemetryAdapters[i], NULL, adaptExt);
+        InterlockedCompareExchangePointer((PVOID volatile *)&VioScsiTelemetryDirectory.Adapters[i], NULL, adaptExt);
     }
 }
 

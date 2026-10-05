@@ -37,7 +37,7 @@
 
 // Mirrors vioscsi/vioscsi.h.
 const MODULE = "vioscsi";
-const ADAPTER_LIST_SYMBOL = "VioScsiTelemetryAdapters";
+const DIRECTORY_SYMBOL = "VioScsiTelemetryDirectory";
 const ADAPTER_POINTER_TYPE = "_ADAPTER_EXTENSION *";
 const STOR_TELEMETRY_MAGIC = 0x53505331;
 const STOR_TELEMETRY_MIN_VERSION = 3;
@@ -200,7 +200,7 @@ function adapterPointers(address) {
         return [host.createPointerObject(address, MODULE, ADAPTER_POINTER_TYPE)];
     }
     const out = [];
-    for (const p of host.getModuleSymbol(MODULE, ADAPTER_LIST_SYMBOL)) {
+    for (const p of host.getModuleSymbol(MODULE, DIRECTORY_SYMBOL).Adapters) {
         if (!p.isNull) {
             out.push(p);
         }
@@ -271,7 +271,7 @@ function printTelemetry(address, all) {
     const showAll = all !== undefined && !isZero(all);
     const adapters = vioscsiTelemetry(address);
     if (adapters.length === 0) {
-        log("No vioscsi adapters registered in " + MODULE + "!" + ADAPTER_LIST_SYMBOL);
+        log("No vioscsi adapters registered in " + MODULE + "!" + DIRECTORY_SYMBOL);
         return;
     }
     for (const a of adapters) {

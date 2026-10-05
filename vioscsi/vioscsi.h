@@ -390,11 +390,6 @@ C_ASSERT(sizeof(STOR_TELEMETRY) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CP
 
 C_ASSERT(sizeof(VIOSCSI_IOCTL_SIGNATURE) == RTL_FIELD_SIZE(SRB_IO_CONTROL, Signature));
 
-//
-// Started (non-dump) adapters are listed in the global VioScsiTelemetryAdapters[]
-// so a debugger script (Tools/debug/vioscsi_telemetry.js) can find each one's
-// Telemetry in a kernel dump without walking Storport's internal structures.
-//
 #define VIOSCSI_MAX_TELEMETRY_ADAPTERS 16
 
 FORCEINLINE ULONG
@@ -517,6 +512,37 @@ typedef struct _ADAPTER_EXTENSION
     BOOLEAN bRemoved;
     STOR_TELEMETRY Telemetry;
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
+
+//
+// Started (non-dump) adapters are listed in the global VioScsiTelemetryDirectory so a
+// debugger script (Tools/debug/vioscsi_telemetry.js) can find each one's Telemetry in a
+// kernel dump without walking Storport's internal structures. Only the first
+// VIOSCSI_MAX_TELEMETRY_ADAPTERS adapters are listed; later ones are left out.
+//
+// With symbols the script reads the directory by name. Without them it scans the writable
+// sections of the vioscsi image for VIOSCSI_TELEMETRY_DIRECTORY_MAGIC and uses PointerSize
+// and TelemetryOffset to reach each adapter's STOR_TELEMETRY. The magic is written only by
+// the directory's static initializer, never by code, so the directory is the only place it
+// appears in the image. Same versioning rules as STOR_TELEMETRY: append fields only, bump
+// Version.
+//
+#define VIOSCSI_TELEMETRY_DIRECTORY_MAGIC   0x44545356 // 'VSTD' in memory byte order
+#define VIOSCSI_TELEMETRY_DIRECTORY_VERSION 1
+
+typedef struct _VIOSCSI_TELEMETRY_DIRECTORY
+{
+    ULONG Magic;
+    ULONG Version;
+    ULONG PointerSize;     // sizeof(PVOID) of this build: 4 on x86, 8 on x64/arm64
+    ULONG MaxAdapters;     // length of Adapters[]
+    ULONG TelemetryOffset; // FIELD_OFFSET(ADAPTER_EXTENSION, Telemetry)
+    ULONG Reserved;
+    PADAPTER_EXTENSION Adapters[VIOSCSI_MAX_TELEMETRY_ADAPTERS];
+} VIOSCSI_TELEMETRY_DIRECTORY, *PVIOSCSI_TELEMETRY_DIRECTORY;
+
+C_ASSERT(FIELD_OFFSET(VIOSCSI_TELEMETRY_DIRECTORY, Adapters) == 6 * sizeof(ULONG));
+C_ASSERT(FIELD_OFFSET(VIOSCSI_TELEMETRY_DIRECTORY, Adapters) % sizeof(PVOID) == 0);
+C_ASSERT(FIELD_OFFSET(ADAPTER_EXTENSION, Telemetry) % sizeof(ULONG64) == 0);
 
 #ifndef PCIX_TABLE_POINTER
 typedef struct

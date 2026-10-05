@@ -279,7 +279,7 @@ collected from a guest can be examined elsewhere (Windows PowerShell 5.1 or Powe
 WinDbg JavaScript extension that prints the vioscsi telemetry described under
 [GetVioScsiTelemetry](#getvioscsitelemetry) from a crash dump or a live kernel debugging
 session, in the same format as the PowerShell script. vioscsi lists its started adapters in
-the global `vioscsi!VioScsiTelemetryAdapters`, and the script reads each adapter's
+the global `vioscsi!VioScsiTelemetryDirectory`, and the script reads each adapter's
 `Telemetry` block through the driver's PDB.
 
 The telemetry lives in the adapter's device extension in nonpaged pool, so it is only
