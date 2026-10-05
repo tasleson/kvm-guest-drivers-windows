@@ -54,6 +54,7 @@
 #define VIOSCSI_MS_PORT_INFORM_GUID_INDEX    2
 
 BOOLEAN IsCrashDumpMode;
+PADAPTER_EXTENSION VioScsiTelemetryAdapters[VIOSCSI_MAX_TELEMETRY_ADAPTERS];
 
 sp_DRIVER_INITIALIZE DriverEntry;
 HW_INITIALIZE VioScsiHwInitialize;
@@ -653,6 +654,41 @@ VioScsiPoolAlloc(IN PVOID DeviceExtension, IN SIZE_T size)
     return NULL;
 }
 
+static VOID TelemetryRegisterAdapter(IN PADAPTER_EXTENSION adaptExt)
+{
+    ULONG i;
+
+    if (adaptExt->dump_mode)
+    {
+        return;
+    }
+    for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
+    {
+        if (VioScsiTelemetryAdapters[i] == adaptExt)
+        {
+            return;
+        }
+    }
+    for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
+    {
+        if (InterlockedCompareExchangePointer((PVOID volatile *)&VioScsiTelemetryAdapters[i], adaptExt, NULL) == NULL)
+        {
+            return;
+        }
+    }
+    RhelDbgPrint(TRACE_LEVEL_WARNING, " No free telemetry slot for adapter 0x%p\n", adaptExt);
+}
+
+static VOID TelemetryDeregisterAdapter(IN PADAPTER_EXTENSION adaptExt)
+{
+    ULONG i;
+
+    for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
+    {
+        InterlockedCompareExchangePointer((PVOID volatile *)&VioScsiTelemetryAdapters[i], NULL, adaptExt);
+    }
+}
+
 BOOLEAN
 VioScsiHwInitialize(IN PVOID DeviceExtension)
 {
@@ -882,6 +918,11 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
             return FALSE;
         }
     }
+
+    // Registered here rather than in FindAdapter: HwInitialize runs on both initial start
+    // and ScsiRestartAdapter, and only after FindAdapter succeeded, so a failed FindAdapter
+    // never leaves a dangling entry. ScsiStopAdapter removes it again.
+    TelemetryRegisterAdapter(adaptExt);
 
     virtio_device_ready(&adaptExt->vdev);
     EXIT_FN();
@@ -1257,6 +1298,7 @@ VioScsiAdapterControl(IN PVOID DeviceExtension, IN SCSI_ADAPTER_CONTROL_TYPE Con
         case ScsiStopAdapter:
             {
                 RhelDbgPrint(TRACE_LEVEL_VERBOSE, " ScsiStopAdapter\n");
+                TelemetryDeregisterAdapter(adaptExt);
                 ShutDown(DeviceExtension);
                 if (adaptExt->pmsg_affinity != NULL)
                 {

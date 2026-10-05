@@ -390,6 +390,13 @@ C_ASSERT(sizeof(STOR_TELEMETRY) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CP
 
 C_ASSERT(sizeof(VIOSCSI_IOCTL_SIGNATURE) == RTL_FIELD_SIZE(SRB_IO_CONTROL, Signature));
 
+//
+// Started (non-dump) adapters are listed in the global VioScsiTelemetryAdapters[]
+// so a debugger script (Tools/debug/vioscsi_telemetry.js) can find each one's
+// Telemetry in a kernel dump without walking Storport's internal structures.
+//
+#define VIOSCSI_MAX_TELEMETRY_ADAPTERS 16
+
 FORCEINLINE ULONG
 StorPerfLatencyBucket(IN ULONGLONG ElapsedUs)
 {
