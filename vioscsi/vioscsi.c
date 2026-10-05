@@ -2400,6 +2400,13 @@ VOID VioScsiWmiSrb(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
 // walk the lists here, one queue at a time under that queue's lock (the same lock the I/O path
 // holds while changing the list, so entries and SubmitTime are stable), and publish the result.
 // The cost is proportional to the number of requests in flight and is only paid per IOCTL.
+//
+// The minimums are gathered in a local table (2 KB, which is fine for a kernel stack) and only
+// published at the end, rather than being accumulated in the telemetry table: that would need a
+// reset first, and a reader (or a snapshot copy) in between would see 0 ("nothing in flight")
+// for a target that has requests. If two IOCTLs run at once each publishes a complete, valid
+// result, so the later one simply wins; TargetScanTime is written last and each value is only
+// ever the age of a real request, so the worst case is a slightly older scan time than the data.
 static VOID TelemetryScanTargets(IN PADAPTER_EXTENSION adaptExt)
 {
     ULONGLONG oldest[STOR_TELEMETRY_MAX_TARGETS] = {0};
