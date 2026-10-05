@@ -372,6 +372,24 @@ C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, BusResetCount) == 8 * sizeof(ULONG));
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) % sizeof(ULONG64) == 0);
 C_ASSERT(sizeof(STOR_TELEMETRY) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CPU * sizeof(QUEUE_TELEMETRY));
 
+//
+// IOCTL_SCSI_MINIPORT request returning a compact snapshot of STOR_TELEMETRY:
+// SRB_IO_CONTROL.Signature must be VIOSCSI_IOCTL_SIGNATURE (8 bytes including
+// the NUL) and ControlCode VIOSCSI_IOCTL_QUERY_TELEMETRY. The driver copies
+// the first min(Length, HeaderSize + QueueCount * QueueSize) bytes of the live
+// block into the payload and sets Length to the number of bytes copied.
+// ReturnCode is VIOSCSI_TELEMETRY_RC_TRUNCATED when that is less than the full
+// snapshot; a caller can learn the full size from the header (the first 20
+// bytes hold HeaderSize/QueueSize/QueueCount) and retry with a larger buffer.
+// Tools/debug/GetVioScsiTelemetry.ps1 mirrors these values.
+//
+#define VIOSCSI_IOCTL_SIGNATURE        "VIOSCSI"
+#define VIOSCSI_IOCTL_QUERY_TELEMETRY  0x56530001 // 'VS' 0001
+#define VIOSCSI_TELEMETRY_RC_SUCCESS   0
+#define VIOSCSI_TELEMETRY_RC_TRUNCATED 1
+
+C_ASSERT(sizeof(VIOSCSI_IOCTL_SIGNATURE) == RTL_FIELD_SIZE(SRB_IO_CONTROL, Signature));
+
 FORCEINLINE ULONG
 StorPerfLatencyBucket(IN ULONGLONG ElapsedUs)
 {

@@ -2145,6 +2145,50 @@ VOID VioScsiWmiSrb(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
     EXIT_FN_SRB();
 }
 
+static VOID TelemetryRequest(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    PSRB_IO_CONTROL srbControl = (PSRB_IO_CONTROL)SRB_DATA_BUFFER(Srb);
+    ULONG dataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
+    ULONG queueCount;
+    ULONG snapshotLen;
+    ULONG copyLen;
+
+    // HeaderLength and Length are caller-supplied: never let them address past the SRB buffer.
+    if (dataLen < sizeof(SRB_IO_CONTROL) || srbControl->HeaderLength < sizeof(SRB_IO_CONTROL) ||
+        srbControl->HeaderLength > dataLen || srbControl->Length > dataLen - srbControl->HeaderLength)
+    {
+        RhelDbgPrint(TRACE_LEVEL_ERROR, " TelemetryRequest bad length %lu\n", dataLen);
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BAD_SRB_BLOCK_LENGTH);
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        return;
+    }
+
+    if (RtlCompareMemory(srbControl->Signature, VIOSCSI_IOCTL_SIGNATURE, sizeof(srbControl->Signature)) !=
+        sizeof(srbControl->Signature))
+    {
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_INVALID_REQUEST);
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        return;
+    }
+
+    // Sized from the compile-time layout rather than the stored HeaderSize/QueueSize, so a
+    // corrupted header can't widen the copy beyond the STOR_TELEMETRY object.
+    queueCount = min(adaptExt->Telemetry.QueueCount, MAX_CPU);
+    snapshotLen = (ULONG)FIELD_OFFSET(STOR_TELEMETRY, Queues) + queueCount * (ULONG)sizeof(QUEUE_TELEMETRY);
+    copyLen = min(srbControl->Length, snapshotLen);
+
+    // No lock: counters are updated with interlocked operations, so the snapshot is not
+    // a consistent point-in-time view across fields (and on 32-bit builds an individual
+    // 64-bit counter can tear), which is fine for statistics.
+    RtlCopyMemory((PUCHAR)srbControl + srbControl->HeaderLength, &adaptExt->Telemetry, copyLen);
+
+    srbControl->Length = copyLen;
+    srbControl->ReturnCode = (copyLen < snapshotLen) ? VIOSCSI_TELEMETRY_RC_TRUNCATED : VIOSCSI_TELEMETRY_RC_SUCCESS;
+    SRB_SET_DATA_TRANSFER_LENGTH(Srb, srbControl->HeaderLength + copyLen);
+    SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
+}
+
 VOID VioScsiIoControl(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
 {
     PSRB_IO_CONTROL srbControl;
@@ -2175,6 +2219,10 @@ VOID VioScsiIoControl(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
         case IOCTL_SCSI_MINIPORT_FIRMWARE:
             FirmwareRequest(DeviceExtension, Srb);
             RhelDbgPrint(TRACE_LEVEL_INFORMATION, " <--> IOCTL_SCSI_MINIPORT_FIRMWARE\n");
+            break;
+        case VIOSCSI_IOCTL_QUERY_TELEMETRY:
+            TelemetryRequest(DeviceExtension, Srb);
+            RhelDbgPrint(TRACE_LEVEL_INFORMATION, " <--> VIOSCSI_IOCTL_QUERY_TELEMETRY\n");
             break;
         default:
             SRB_SET_SRB_STATUS(Srb, SRB_STATUS_INVALID_REQUEST);
