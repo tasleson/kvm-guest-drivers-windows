@@ -8,6 +8,7 @@ This directory contains diagnostic tools for Windows guest systems running virti
 - **GetVirtioWinInfo.ps1** - Quick version check and reboot status (~5 seconds)
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics from WinPE/WinRE
 - **GetVioScsiTelemetry.ps1** - vioscsi per-queue I/O, latency and error counters from a running system
+- **vioscsi_telemetry.js** - WinDbg script showing the same vioscsi counters from a kernel crash dump
 
 ---
 
@@ -268,6 +269,36 @@ the histogram bucket they fall in (buckets double in width).
 
 `-InputFile` parses a saved snapshot without talking to the driver, so a `.bin`
 collected from a guest can be examined elsewhere (Windows PowerShell 5.1 or PowerShell 7).
+
+---
+
+# vioscsi_telemetry.js
+
+## Overview
+
+WinDbg JavaScript extension that prints the vioscsi telemetry described under
+[GetVioScsiTelemetry](#getvioscsitelemetry) from a crash dump or a live kernel debugging
+session, in the same format as the PowerShell script. vioscsi lists its started adapters in
+the global `vioscsi!VioScsiTelemetryAdapters`, and the script reads each adapter's
+`Telemetry` block through the driver's PDB.
+
+The telemetry lives in the adapter's device extension in nonpaged pool, so it is only
+present in **kernel, automatic or complete memory dumps**. Small memory dumps (minidumps)
+don't contain it. Matching vioscsi symbols are required.
+
+## Usage
+
+```
+.scriptload C:\path\to\vioscsi_telemetry.js
+!vioscsi_telemetry                       # every registered vioscsi adapter
+!vioscsi_telemetry <adapter extension>   # one adapter, by its miniport device extension address
+!vioscsi_telemetry 0 1                   # all adapters, including queues with no completions
+dx @$vioscsiTelemetry()                  # the same data as debugger data model objects
+dx -r3 @$vioscsiTelemetry()[0].Queues    # per-queue values including raw histograms
+```
+
+The raw structure is also available directly, e.g.
+`dx -r2 ((vioscsi!_ADAPTER_EXTENSION *)<address>)->Telemetry`.
 
 ---
 
