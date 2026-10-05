@@ -171,6 +171,7 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         InsertTailList(&element->srb_list, &srbExt->list_entry);
         element->srb_cnt++;
         StorPerfSyncInFlight(queueStats, element);
+        StorPerfTargetSubmitted(&adaptExt->Telemetry, srbExt);
         // Called under VioScsiVQLock for this queue, so a plain compare/update is safe.
         if (element->srb_cnt > queueStats->InFlightHighWaterMark)
         {
