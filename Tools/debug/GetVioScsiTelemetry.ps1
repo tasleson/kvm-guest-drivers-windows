@@ -1,27 +1,38 @@
 <#
 .SYNOPSIS
-    Read and summarize vioscsi per-queue I/O, latency and error telemetry.
+    Read and summarize vioscsi per-queue and per-target I/O, latency and error telemetry.
 
 .DESCRIPTION
     Queries every vioscsi adapter in the running system with an IOCTL_SCSI_MINIPORT
     request and prints a summary of the driver's STOR_TELEMETRY block: reset counts,
     then per-queue I/O counts, bytes, latency (avg/min/max and approximate p50/p99 from
     the log2 histogram), in-flight high-water mark and queue-full count, and a
-    non-zero SRB status histogram. Counters are cumulative since the adapter was
+    non-zero SRB status histogram. Stall indicators are the in-flight count, the age of
+    the oldest in-flight request, the time since the last completion, counts of requests
+    slower than 1s/5s/30s, and the time since the last reset. A request that never
+    completes is not in the latency figures, so look at the oldest in-flight age when
+    chasing storage timeouts.
+
+    Requests of one SCSI target are spread over all queues, so on an adapter with several
+    targets the per-queue view cannot say which disk has the problem. The per-target
+    section lists each active target with its I/O counts, latency, stall indicators and
+    error counters (BUSY, ABORTED/BUS_RESET, NO_DEVICE, other errors, INVALID_TARGET_ID),
+    and flags a target that has requests in flight but none completing (STALLED: oldest
+    request outstanding 5 seconds or more). Counters are cumulative since the adapter was
     started; take two snapshots to compute rates.
 
-    Requires Administrator rights and a vioscsi driver with telemetry version 3 or
-    later. A blob saved with -SaveRaw can be parsed later, on any machine, with
-    -InputFile.
+    Requires Administrator rights and a vioscsi driver with telemetry version 5 or
+    later. A blob saved with -SaveRaw can be parsed later, on any machine, with -InputFile.
 
 .PARAMETER Port
     Query only these \\.\ScsiN: port numbers instead of every vioscsi adapter.
 
 .PARAMETER All
-    Also list queues that have not completed any request.
+    Also list queues that have not completed any request and targets with no activity.
 
 .PARAMETER PassThru
-    Emit one object per adapter instead of printing a summary.
+    Emit one object per adapter instead of printing a summary. Its Queues and Targets
+    properties hold one object per queue and per reported target.
 
 .PARAMETER SaveRaw
     Directory to write each adapter's raw telemetry blob to (as a .bin file).
@@ -37,6 +48,9 @@
 
 .EXAMPLE
     (.\GetVioScsiTelemetry.ps1 -PassThru)[0].Queues | Format-Table
+
+.EXAMPLE
+    (.\GetVioScsiTelemetry.ps1 -PassThru)[0].Targets | Where-Object Stalled
 #>
 
 #  Copyright (c) 2026 Red Hat, Inc. and/or its affiliates. All rights reserved.
@@ -81,12 +95,26 @@ $VIOSCSI_IOCTL_SIGNATURE        = [byte[]]([Text.Encoding]::ASCII.GetBytes('VIOS
 $VIOSCSI_IOCTL_QUERY_TELEMETRY  = [uint32]0x56530001
 $VIOSCSI_TELEMETRY_RC_TRUNCATED = [uint32]1
 $STOR_TELEMETRY_MAGIC           = [uint32]0x53505331
-$STOR_TELEMETRY_MIN_VERSION     = 3
-# Fixed STOR_TELEMETRY header: Magic, Version, HeaderSize, QueueSize, QueueCount,
-# LatencyBuckets, StatusSlots, Reserved (8 ULONGs), then the adapter-wide ULONG64s.
-$HEADER_FIXED_SIZE              = 32
-$HEADER_V3_SIZE                 = 80
+$STOR_TELEMETRY_MIN_VERSION     = 5
+# STOR_TELEMETRY header: Magic, Version, HeaderSize, QueueSize, QueueCount, TargetSize,
+# TargetCount, TargetsOffset, LatencyBuckets, StatusSlots, Reserved[2] (12 ULONGs), then the
+# adapter-wide ULONG64s up to TargetScanTime. The first 28 bytes are enough to size a retry.
+$HEADER_SIZE_FIELDS             = 28
+$HEADER_MIN_SIZE                = 128
+# QUEUE_TELEMETRY ends with 56 bytes after QueueFullCount: OldestInFlightTime,
+# LastCompletionTime, MaxLatencyTime, Slow1s/5s/30sCount (ULONG64s), InFlightCount and a
+# ULONG of padding.
+$QUEUE_TAIL_SIZE                = 56
+# TARGET_TELEMETRY: TargetId, InFlightCount (ULONGs), then 22 ULONG64s.
+$TARGET_MIN_SIZE                = 184
+# Timestamps are interrupt time in 100 ns units; ages are taken against SnapshotTime.
+$HNS_PER_US                     = 10
+# A request outstanding this long is flagged in the summary.
+$STALL_WARN_US                  = 5000000
 $INITIAL_QUERY_SIZE             = 4096
+$MAX_QUERY_ATTEMPTS             = 3
+# Upper bound for a retry: the header plus 256 queues plus 256 targets is well under this.
+$MAX_SNAPSHOT_SIZE              = 1MB
 $IOCTL_TIMEOUT_SEC              = 10
 
 # Indexed by SRB_STATUS_* with SRB_STATUS_QUEUE_FROZEN/AUTOSENSE_VALID masked off (srb.h).
@@ -193,20 +221,28 @@ function Invoke-TelemetryQuery([int]$PortNumber) {
     $rc = [uint32]0
     $data = [VioScsiTelemetryIoctl]::Query($path, $VIOSCSI_IOCTL_SIGNATURE, $VIOSCSI_IOCTL_QUERY_TELEMETRY,
                                            $IOCTL_TIMEOUT_SEC, $INITIAL_QUERY_SIZE, [ref]$rc)
-    if ($rc -eq $VIOSCSI_TELEMETRY_RC_TRUNCATED -and $data.Length -ge 20) {
-        # The header tells us how large the full snapshot is; ask again with that size.
-        $required = [BitConverter]::ToUInt32($data, 8) +
-                    [uint64][BitConverter]::ToUInt32($data, 12) * [BitConverter]::ToUInt32($data, 16)
+    # The header tells us how large the full snapshot is; ask again with that size. The set of
+    # active targets can grow between queries, so allow for a few retries.
+    $attempt = 0
+    while ($rc -eq $VIOSCSI_TELEMETRY_RC_TRUNCATED -and $data.Length -ge $HEADER_SIZE_FIELDS -and $attempt -lt $MAX_QUERY_ATTEMPTS) {
+        $attempt++
+        $required = [uint64][BitConverter]::ToUInt32($data, 8) +
+                    [uint64][BitConverter]::ToUInt32($data, 12) * [BitConverter]::ToUInt32($data, 16) +
+                    [uint64][BitConverter]::ToUInt32($data, 20) * [BitConverter]::ToUInt32($data, 24)
+        # Leave room for a few more targets turning active between the two queries.
+        $required += 4 * [uint64][BitConverter]::ToUInt32($data, 20)
+        if ($required -le $data.Length -or $required -gt $MAX_SNAPSHOT_SIZE) { break }
         try {
             $data = [VioScsiTelemetryIoctl]::Query($path, $VIOSCSI_IOCTL_SIGNATURE, $VIOSCSI_IOCTL_QUERY_TELEMETRY,
                                                    $IOCTL_TIMEOUT_SEC, [int]$required, [ref]$rc)
         } catch {
-            # Keep the truncated first snapshot rather than losing everything.
+            # Keep the truncated snapshot rather than losing everything.
             Write-Warning "${path}: full-size query of $required bytes failed: $(Get-ErrorText $_)"
+            break
         }
     }
     if ($rc -eq $VIOSCSI_TELEMETRY_RC_TRUNCATED) {
-        Write-Warning "$path returned a truncated snapshot; showing the queues that fit"
+        Write-Warning "$path returned a truncated snapshot; showing the queues and targets that fit"
     }
     return ,$data
 }
@@ -225,8 +261,16 @@ function Get-HistogramPercentileUs([uint64[]]$Buckets, [double]$Fraction) {
     return [math]::Pow(2, $Buckets.Length)
 }
 
+function Get-AgeUs($Now, $Then) {
+    # Timestamps are interrupt time in 100 ns units, 0 meaning never/none. A request queued just
+    # after the snapshot time was taken can be slightly newer than it, so clamp to 0.
+    if (-not $Now -or -not $Then) { return $null }
+    if ($Then -ge $Now) { return [uint64]0 }
+    return [uint64][math]::Floor(($Now - $Then) / $HNS_PER_US)
+}
+
 function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
-    if ($Data.Length -lt $HEADER_FIXED_SIZE) {
+    if ($Data.Length -lt $HEADER_MIN_SIZE) {
         throw "${Source}: snapshot is only $($Data.Length) bytes, too short for a telemetry header"
     }
     $magic = [BitConverter]::ToUInt32($Data, 0)
@@ -240,21 +284,37 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
     $headerSize = [BitConverter]::ToUInt32($Data, 8)
     $queueSize = [BitConverter]::ToUInt32($Data, 12)
     $queueCount = [BitConverter]::ToUInt32($Data, 16)
-    $latencyBuckets = [int][BitConverter]::ToUInt32($Data, 20)
-    $statusSlots = [int][BitConverter]::ToUInt32($Data, 24)
+    $targetSize = [BitConverter]::ToUInt32($Data, 20)
+    $targetCount = [BitConverter]::ToUInt32($Data, 24)
+    $targetsOffset = [BitConverter]::ToUInt32($Data, 28)
+    $latencyBuckets = [int][BitConverter]::ToUInt32($Data, 32)
+    $statusSlots = [int][BitConverter]::ToUInt32($Data, 36)
 
     # QUEUE_TELEMETRY field offsets; the arrays are sized by the header so these follow them.
     $offLatencyCount = 56 + 8 * $latencyBuckets
     $offStatus = $offLatencyCount + 32
     $offHwm = $offStatus + 8 * $statusSlots
     $offQueueFull = $offHwm + 8
-    if ($headerSize -lt $HEADER_V3_SIZE -or $queueSize -lt ($offQueueFull + 8) -or $Data.Length -lt $headerSize) {
-        throw "${Source}: inconsistent telemetry header (HeaderSize=$headerSize QueueSize=$queueSize, $($Data.Length) bytes)"
+    $offTail = $offQueueFull + 8
+    $minQueue = $offTail + $QUEUE_TAIL_SIZE
+    if ($headerSize -lt $HEADER_MIN_SIZE -or $queueSize -lt $minQueue -or $targetSize -lt $TARGET_MIN_SIZE -or
+        $targetsOffset -lt $headerSize -or $Data.Length -lt $headerSize) {
+        throw ("${Source}: inconsistent telemetry header (HeaderSize=$headerSize QueueSize=$queueSize " +
+               "TargetSize=$targetSize TargetsOffset=$targetsOffset, $($Data.Length) bytes)")
     }
-    $available = [uint32][math]::Floor(($Data.Length - $headerSize) / $queueSize)
-    if ($available -lt $queueCount) {
-        Write-Warning "${Source}: snapshot holds $available of $queueCount queues"
-        $queueCount = $available
+    $availableQueues = [uint32][math]::Floor(($Data.Length - $headerSize) / $queueSize)
+    if ($availableQueues -lt $queueCount) {
+        Write-Warning "${Source}: snapshot holds $availableQueues of $queueCount queues"
+        $queueCount = $availableQueues
+    }
+    # The target table follows the queues in a snapshot, but is located by TargetsOffset so a
+    # table that doesn't start right after them (the in-memory layout) reads correctly too.
+    $availableTargets = $(if ($Data.Length -gt $targetsOffset) {
+                              [uint32][math]::Floor(($Data.Length - $targetsOffset) / $targetSize)
+                          } else { [uint32]0 })
+    if ($availableTargets -lt $targetCount) {
+        Write-Warning "${Source}: snapshot holds $availableTargets of $targetCount targets"
+        $targetCount = $availableTargets
     }
 
     $u64 = { param($Offset) [BitConverter]::ToUInt64($Data, $Offset) }
@@ -265,34 +325,101 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
         ,$a
     }
 
+    # Ages are relative to the time the driver took the snapshot (interrupt time, 100 ns units).
+    $snapshotTime = & $u64 104
+    $targetScanTime = & $u64 120
+
     $queues = for ($q = 0; $q -lt $queueCount; $q++) {
         $base = $headerSize + $q * $queueSize
         $buckets = & $u64Array ($base + 56) $latencyBuckets
         $count = & $u64 ($base + $offLatencyCount)
         $sum = & $u64 ($base + $offLatencyCount + 8)
         [PSCustomObject]@{
-            Queue           = $q
-            Reads           = & $u64 ($base + 0)
-            Writes          = & $u64 ($base + 8)
-            Flushes         = & $u64 ($base + 16)
-            Unmaps          = & $u64 ($base + 24)
-            Other           = & $u64 ($base + 32)
-            ReadBytes       = & $u64 ($base + 40)
-            WriteBytes      = & $u64 ($base + 48)
-            Completions     = $count
-            LatencySumUs    = $sum
-            AvgUs           = $(if ($count) { [math]::Round($sum / $count, 1) } else { $null })
-            MinUs           = & $u64 ($base + $offLatencyCount + 16)
-            MaxUs           = & $u64 ($base + $offLatencyCount + 24)
-            P50Us           = Get-HistogramPercentileUs $buckets 0.50
-            P99Us           = Get-HistogramPercentileUs $buckets 0.99
-            InFlightHwm     = [BitConverter]::ToUInt32($Data, $base + $offHwm)
-            QueueFull       = & $u64 ($base + $offQueueFull)
-            LatencyBuckets  = $buckets
-            StatusHistogram = & $u64Array ($base + $offStatus) $statusSlots
+            Queue               = $q
+            Reads               = & $u64 ($base + 0)
+            Writes              = & $u64 ($base + 8)
+            Flushes             = & $u64 ($base + 16)
+            Unmaps              = & $u64 ($base + 24)
+            Other               = & $u64 ($base + 32)
+            ReadBytes           = & $u64 ($base + 40)
+            WriteBytes          = & $u64 ($base + 48)
+            Completions         = $count
+            LatencySumUs        = $sum
+            AvgUs               = $(if ($count) { [math]::Round($sum / $count, 1) } else { $null })
+            MinUs               = & $u64 ($base + $offLatencyCount + 16)
+            MaxUs               = & $u64 ($base + $offLatencyCount + 24)
+            P50Us               = Get-HistogramPercentileUs $buckets 0.50
+            P99Us               = Get-HistogramPercentileUs $buckets 0.99
+            InFlightHwm         = [BitConverter]::ToUInt32($Data, $base + $offHwm)
+            QueueFull           = & $u64 ($base + $offQueueFull)
+            InFlight            = [BitConverter]::ToUInt32($Data, $base + $offTail + 48)
+            OldestInFlightAgeUs = Get-AgeUs $snapshotTime (& $u64 ($base + $offTail))
+            LastCompletionAgeUs = Get-AgeUs $snapshotTime (& $u64 ($base + $offTail + 8))
+            MaxLatencyAgeUs     = Get-AgeUs $snapshotTime (& $u64 ($base + $offTail + 16))
+            Slow1s              = & $u64 ($base + $offTail + 24)
+            Slow5s              = & $u64 ($base + $offTail + 32)
+            Slow30s             = & $u64 ($base + $offTail + 40)
+            LatencyBuckets      = $buckets
+            StatusHistogram     = & $u64Array ($base + $offStatus) $statusSlots
         }
     }
     $queues = @($queues)
+
+    # TARGET_TELEMETRY: offsets are fixed (no variable-size arrays), see vioscsi.h.
+    # @() around the loop: with no targets it must stay an empty array, not become @($null).
+    $targets = @(for ($t = 0; $t -lt $targetCount; $t++) {
+        $base = $targetsOffset + $t * $targetSize
+        $inFlight = [BitConverter]::ToUInt32($Data, $base + 4)
+        $reads = & $u64 ($base + 8)
+        $writes = & $u64 ($base + 16)
+        $other = & $u64 ($base + 24)
+        $latencyCount = & $u64 ($base + 64)
+        $latencySum = & $u64 ($base + 72)
+        $oldestAge = $(if ($targetScanTime) { Get-AgeUs $snapshotTime (& $u64 ($base + 48)) } else { $null })
+        $lastCompletionAge = Get-AgeUs $snapshotTime (& $u64 ($base + 56))
+        # Stalled: requests are outstanding and the oldest has waited too long. A request that
+        # arrived after the driver's scan has no oldest age yet and is too young to judge. Only a
+        # blob that was never scanned has to fall back to the time since the last completion.
+        $stallReason = $null
+        if ($inFlight) {
+            if ($targetScanTime) {
+                if ($null -ne $oldestAge -and $oldestAge -ge $STALL_WARN_US) {
+                    $stallReason = "oldest request outstanding $(Format-Us $oldestAge)"
+                }
+            } elseif ($null -ne $lastCompletionAge -and $lastCompletionAge -ge $STALL_WARN_US) {
+                $stallReason = "no completion for $(Format-Us $lastCompletionAge)"
+            }
+        }
+        [PSCustomObject]@{
+            Target              = [BitConverter]::ToUInt32($Data, $base)
+            InFlight            = $inFlight
+            OldestInFlightAgeUs = $(if ($inFlight) { $oldestAge } else { $null })
+            LastCompletionAgeUs = $lastCompletionAge
+            Stalled             = [bool]$stallReason
+            StallReason         = $stallReason
+            Reads               = $reads
+            Writes              = $writes
+            Other               = $other
+            ReadBytes           = & $u64 ($base + 32)
+            WriteBytes          = & $u64 ($base + 40)
+            Completions         = $latencyCount
+            LatencySumUs        = $latencySum
+            AvgUs               = $(if ($latencyCount) { [math]::Round($latencySum / $latencyCount, 1) } else { $null })
+            MaxUs               = & $u64 ($base + 80)
+            MaxLatencyAgeUs     = Get-AgeUs $snapshotTime (& $u64 ($base + 88))
+            Slow1s              = & $u64 ($base + 96)
+            Slow5s              = & $u64 ($base + 104)
+            Slow30s             = & $u64 ($base + 112)
+            Busy                = & $u64 ($base + 120)
+            Aborted             = & $u64 ($base + 128)
+            NoDevice            = & $u64 ($base + 136)
+            Errors              = & $u64 ($base + 144)
+            InvalidTarget       = & $u64 ($base + 152)
+            DeviceResets        = & $u64 ($base + 160)
+            LunResets           = & $u64 ($base + 168)
+            LastResetAgeUs      = Get-AgeUs $snapshotTime (& $u64 ($base + 176))
+        }
+    })
 
     # Totals across queues; histograms are summed so percentiles stay meaningful.
     $totalBuckets = New-Object 'uint64[]' $latencyBuckets
@@ -300,12 +427,25 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
     $total = [ordered]@{ Queue = 'Total'; Reads = [uint64]0; Writes = [uint64]0; Flushes = [uint64]0; Unmaps = [uint64]0
                          Other = [uint64]0; ReadBytes = [uint64]0; WriteBytes = [uint64]0; Completions = [uint64]0
                          LatencySumUs = [uint64]0; MinUs = [uint64]0; MaxUs = [uint64]0; InFlightHwm = [uint32]0
-                         QueueFull = [uint64]0 }
+                         QueueFull = [uint64]0; InFlight = [uint64]0; OldestInFlightAgeUs = $null
+                         LastCompletionAgeUs = $null; MaxLatencyAgeUs = $null
+                         Slow1s = [uint64]0; Slow5s = [uint64]0; Slow30s = [uint64]0 }
     foreach ($q in $queues) {
         foreach ($f in 'Reads', 'Writes', 'Flushes', 'Unmaps', 'Other', 'ReadBytes', 'WriteBytes', 'Completions',
-                       'LatencySumUs', 'QueueFull') {
+                       'LatencySumUs', 'QueueFull', 'InFlight', 'Slow1s', 'Slow5s', 'Slow30s') {
             $total[$f] += $q.$f
         }
+        # Oldest request: the largest age. Last completion: the smallest age (most recent).
+        if ($null -ne $q.OldestInFlightAgeUs -and
+            ($null -eq $total.OldestInFlightAgeUs -or $q.OldestInFlightAgeUs -gt $total.OldestInFlightAgeUs)) {
+            $total.OldestInFlightAgeUs = $q.OldestInFlightAgeUs
+        }
+        if ($null -ne $q.LastCompletionAgeUs -and
+            ($null -eq $total.LastCompletionAgeUs -or $q.LastCompletionAgeUs -lt $total.LastCompletionAgeUs)) {
+            $total.LastCompletionAgeUs = $q.LastCompletionAgeUs
+        }
+        # The max latency time belongs to the queue holding the overall max.
+        if ($q.MaxUs -gt $total.MaxUs) { $total.MaxLatencyAgeUs = $q.MaxLatencyAgeUs }
         if ($q.MinUs -and (-not $total.MinUs -or $q.MinUs -lt $total.MinUs)) { $total.MinUs = $q.MinUs }
         if ($q.MaxUs -gt $total.MaxUs) { $total.MaxUs = $q.MaxUs }
         if ($q.InFlightHwm -gt $total.InFlightHwm) { $total.InFlightHwm = $q.InFlightHwm }
@@ -330,13 +470,18 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
         Source                      = $Source
         Version                     = $version
         QueueCount                  = $queueCount
-        BusResetCount               = & $u64 32
-        DeviceResetCount            = & $u64 40
-        LogicalUnitResetCount       = & $u64 48
-        LastResetDurationUs         = & $u64 56
-        MaxResetDurationUs          = & $u64 64
-        DeviceResetTmfInFlightCount = & $u64 72
+        TargetCount                 = $targetCount
+        BusResetCount               = & $u64 48
+        DeviceResetCount            = & $u64 56
+        LogicalUnitResetCount       = & $u64 64
+        LastResetDurationUs         = & $u64 72
+        MaxResetDurationUs          = & $u64 80
+        DeviceResetTmfInFlightCount = & $u64 88
+        LastResetTime               = & $u64 96
+        LastResetAgeUs              = Get-AgeUs $snapshotTime (& $u64 96)
+        OutOfRangeTargetCount       = & $u64 112
         Queues                      = $queues
+        Targets                     = $targets
         Total                       = [PSCustomObject]$total
         Status                      = [PSCustomObject]$status
     }
@@ -349,13 +494,32 @@ function Format-Us($Us) {
     return '{0:N0}us' -f $Us
 }
 
+function Format-Ago($Us) {
+    if ($null -eq $Us) { return '-' }
+    return "$(Format-Us $Us) ago"
+}
+
+function Test-TargetActive($Target) {
+    # Mirrors StorPerfTargetActive() in the driver, which is what decides if a target is reported.
+    return [bool]($Target.InFlight -or $Target.Reads -or $Target.Writes -or $Target.Other -or $Target.NoDevice -or
+                  $Target.DeviceResets -or $Target.LunResets)
+}
+
 function Write-TelemetrySummary($T) {
-    $rows = @($T.Queues | Where-Object { $All -or $_.Completions -or $_.QueueFull }) + $T.Total
+    $rows = @($T.Queues | Where-Object { $All -or $_.Completions -or $_.QueueFull -or $_.InFlight }) + $T.Total
     Write-Host ''
-    Write-Host ("== {0}  (telemetry v{1}, {2} queues)" -f $T.Source, $T.Version, $T.QueueCount)
+    Write-Host ("== {0}  (telemetry v{1}, {2} queues, {3} targets reported)" -f
+                $T.Source, $T.Version, $T.QueueCount, $T.TargetCount)
     Write-Host ("Resets: bus {0}, device {1}, LUN {2}; last {3}, max {4}; DeviceReset with TMF in flight {5}" -f
                 $T.BusResetCount, $T.DeviceResetCount, $T.LogicalUnitResetCount,
                 (Format-Us $T.LastResetDurationUs), (Format-Us $T.MaxResetDurationUs), $T.DeviceResetTmfInFlightCount)
+    # No age means either no reset yet (time 0) or no time reference to measure it against.
+    $lastReset = $(if ($null -ne $T.LastResetAgeUs) { Format-Ago $T.LastResetAgeUs }
+                   elseif ($T.LastResetTime) { 'unknown' } else { 'never' })
+    Write-Host ("Last reset: {0}" -f $lastReset)
+    if ($T.OutOfRangeTargetCount) {
+        Write-Host ("Requests refused for a target ID beyond the device's maximum: {0}" -f $T.OutOfRangeTargetCount)
+    }
     $rows | Format-Table -AutoSize -Property Queue, Reads, Writes, Flushes, Unmaps, Other,
         @{ n = 'ReadMB'; e = { '{0:N1}' -f ($_.ReadBytes / 1MB) }; a = 'right' },
         @{ n = 'WriteMB'; e = { '{0:N1}' -f ($_.WriteBytes / 1MB) }; a = 'right' },
@@ -366,6 +530,57 @@ function Write-TelemetrySummary($T) {
         @{ n = 'p99<='; e = { Format-Us $_.P99Us }; a = 'right' },
         @{ n = 'HWM'; e = { $_.InFlightHwm } },
         @{ n = 'QFull'; e = { $_.QueueFull } } | Out-Host
+    Write-Host ''
+    Write-Host 'Stall indicators (ages are relative to the snapshot time):'
+    $rows | Format-Table -AutoSize -Property Queue,
+        @{ n = 'InFlight'; e = { $_.InFlight } },
+        @{ n = 'OldestInFlight'; e = { Format-Us $_.OldestInFlightAgeUs }; a = 'right' },
+        @{ n = 'LastCompletion'; e = { Format-Ago $_.LastCompletionAgeUs }; a = 'right' },
+        @{ n = 'MaxLatencyAt'; e = { Format-Ago $_.MaxLatencyAgeUs }; a = 'right' },
+        @{ n = '>1s'; e = { $_.Slow1s } },
+        @{ n = '>5s'; e = { $_.Slow5s } },
+        @{ n = '>30s'; e = { $_.Slow30s } } | Out-Host
+    foreach ($q in $T.Queues) {
+        if ($q.InFlight -and $null -ne $q.OldestInFlightAgeUs -and $q.OldestInFlightAgeUs -ge $STALL_WARN_US) {
+            Write-Host ("WARNING: queue {0} has {1} request(s) in flight, the oldest for {2}" -f
+                        $q.Queue, $q.InFlight, (Format-Us $q.OldestInFlightAgeUs)) -ForegroundColor Yellow
+        }
+    }
+
+    $targetRows = @($T.Targets | Where-Object { $All -or (Test-TargetActive $_) })
+    if ($targetRows.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Per target (a target spans all queues):'
+        $targetRows | Format-Table -AutoSize -Property Target,
+            @{ n = 'State'; e = { if ($_.Stalled) { 'STALLED' } else { '' } } },
+            @{ n = 'InFlight'; e = { $_.InFlight } },
+            @{ n = 'OldestInFlight'; e = { Format-Us $_.OldestInFlightAgeUs }; a = 'right' },
+            @{ n = 'LastCompletion'; e = { Format-Ago $_.LastCompletionAgeUs }; a = 'right' },
+            Reads, Writes, Other,
+            @{ n = 'ReadMB'; e = { '{0:N1}' -f ($_.ReadBytes / 1MB) }; a = 'right' },
+            @{ n = 'WriteMB'; e = { '{0:N1}' -f ($_.WriteBytes / 1MB) }; a = 'right' },
+            @{ n = 'Avg'; e = { Format-Us $_.AvgUs }; a = 'right' },
+            @{ n = 'Max'; e = { Format-Us $(if ($_.Completions) { $_.MaxUs }) }; a = 'right' },
+            @{ n = '>1s'; e = { $_.Slow1s } },
+            @{ n = '>5s'; e = { $_.Slow5s } },
+            @{ n = '>30s'; e = { $_.Slow30s } } | Out-Host
+        Write-Host 'Per target errors and resets:'
+        $targetRows | Format-Table -AutoSize -Property Target,
+            Busy, Aborted, NoDevice, Errors, InvalidTarget,
+            @{ n = 'DevResets'; e = { $_.DeviceResets } },
+            @{ n = 'LunResets'; e = { $_.LunResets } },
+            @{ n = 'LastReset'; e = { Format-Ago $_.LastResetAgeUs }; a = 'right' } | Out-Host
+        # Not $t: PowerShell variable names are case-insensitive and this function's parameter is $T.
+        foreach ($tgt in $targetRows) {
+            if ($tgt.Stalled) {
+                Write-Host ("WARNING: target {0} has {1} request(s) in flight, {2}" -f
+                            $tgt.Target, $tgt.InFlight, $tgt.StallReason) -ForegroundColor Yellow
+            }
+        }
+    } else {
+        Write-Host ''
+        Write-Host 'No target has seen any I/O yet.'
+    }
     $statusText = ($T.Status.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
     Write-Host ("SRB status: {0}" -f $(if ($statusText) { $statusText } else { '(none)' }))
 }
