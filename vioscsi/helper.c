@@ -167,7 +167,7 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
 
         notify = virtqueue_kick_prepare(adaptExt->vq[QueueNumber]);
         element = &adaptExt->processing_srbs[vq_req_idx];
-        srbExt->SubmitTime = StorPerfNow(adaptExt);
+        srbExt->SubmitTime = StorPerfInterruptTime(adaptExt);
         InsertTailList(&element->srb_list, &srbExt->list_entry);
         element->srb_cnt++;
         StorPerfSyncInFlight(queueStats, element);

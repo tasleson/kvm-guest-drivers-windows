@@ -1816,7 +1816,8 @@ PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                     InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.LogicalUnitResetCount);
                     break;
             }
-            InterlockedExchange64((PLONG64)&adaptExt->Telemetry.LastResetTime, (LONG64)StorPerfNow(adaptExt));
+            InterlockedExchange64((PLONG64)&adaptExt->Telemetry.LastResetTime,
+                                  (LONG64)StorPerfInterruptTime(adaptExt));
 
             switch (adaptExt->action_on_reset)
             {
@@ -1947,7 +1948,7 @@ RecordIoCompletionStats(IN PADAPTER_EXTENSION adaptExt, IN PSRB_TYPE Srb, IN PSR
     InterlockedIncrement64((PLONG64)&queueStats->Latency.Count);
     InterlockedExchangeAdd64((PLONG64)&queueStats->Latency.SumUs, (LONG64)ElapsedUs);
     StorPerfUpdateMin(&queueStats->Latency.MinUs, ElapsedUs);
-    now = StorPerfNow(adaptExt);
+    now = StorPerfInterruptTime(adaptExt);
     if (StorPerfUpdateMax(&queueStats->Latency.MaxUs, ElapsedUs))
     {
         InterlockedExchange64((PLONG64)&queueStats->MaxLatencyTime, (LONG64)now);
@@ -2256,7 +2257,7 @@ static VOID TelemetryRequest(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
     snapshotLen = (ULONG)FIELD_OFFSET(STOR_TELEMETRY, Queues) + queueCount * (ULONG)sizeof(QUEUE_TELEMETRY);
     copyLen = min(srbControl->Length, snapshotLen);
 
-    InterlockedExchange64((PLONG64)&adaptExt->Telemetry.SnapshotTime, (LONG64)StorPerfNow(adaptExt));
+    InterlockedExchange64((PLONG64)&adaptExt->Telemetry.SnapshotTime, (LONG64)StorPerfInterruptTime(adaptExt));
 
     // No lock: counters are updated with interlocked operations, so the snapshot is not
     // a consistent point-in-time view across fields (and on 32-bit builds an individual

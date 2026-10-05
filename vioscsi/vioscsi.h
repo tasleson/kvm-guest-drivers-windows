@@ -263,7 +263,7 @@ typedef struct _SRB_EXTENSION
     ULONGLONG time;
     ULONG_PTR id;
     ULONG QueueIndex;     // index into ADAPTER_EXTENSION.processing_srbs / Telemetry.Queues, set by SendSRB
-    ULONGLONG SubmitTime; // StorPerfNow() when queued to the virtqueue, 0 if unknown; feeds OldestInFlightTime
+    ULONGLONG SubmitTime; // StorPerfInterruptTime() when queued to the virtqueue, 0 if unknown; feeds OldestInFlightTime
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
 
@@ -571,7 +571,7 @@ typedef struct _ADAPTER_EXTENSION
 // Current time for telemetry timestamps (see the STOR_TELEMETRY timestamp notes). Returns 0
 // in crash dump mode, where the dump environment may not provide kernel time services.
 FORCEINLINE ULONGLONG
-StorPerfNow(IN PADAPTER_EXTENSION adaptExt)
+StorPerfInterruptTime(IN PADAPTER_EXTENSION adaptExt)
 {
     return adaptExt->dump_mode ? 0 : KeQueryInterruptTime();
 }
