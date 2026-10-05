@@ -363,6 +363,10 @@ VioScsiFindAdapter(IN PVOID DeviceExtension,
     adaptExt->hba_id = HBA_ID;
     adaptExt->Telemetry.Magic = STOR_TELEMETRY_MAGIC;
     adaptExt->Telemetry.Version = STOR_TELEMETRY_VERSION;
+    adaptExt->Telemetry.HeaderSize = (ULONG)FIELD_OFFSET(STOR_TELEMETRY, Queues);
+    adaptExt->Telemetry.QueueSize = (ULONG)sizeof(QUEUE_TELEMETRY);
+    adaptExt->Telemetry.LatencyBuckets = STOR_TELEMETRY_HISTOGRAM_BUCKETS;
+    adaptExt->Telemetry.StatusSlots = STOR_TELEMETRY_STATUS_SLOTS;
     ConfigInfo->Master = TRUE;
     ConfigInfo->ScatterGather = TRUE;
     ConfigInfo->DmaWidth = Width32Bits;
@@ -730,6 +734,10 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
             return FALSE;
         }
     }
+
+    // num_queues is final here (FindAdapter's value may have been adjusted to the granted MSI-X
+    // vectors above), and HwInitialize also runs on restart, so publish it to telemetry now.
+    adaptExt->Telemetry.QueueCount = adaptExt->num_queues;
 
     for (index = 0; index < adaptExt->num_queues; ++index)
     {

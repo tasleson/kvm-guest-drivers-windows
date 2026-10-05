@@ -293,13 +293,28 @@ typedef struct _REQUEST_LIST
 //
 // Runtime performance/error telemetry, kept in the (non-paged) adapter
 // extension so it is present in a crash dump without any extra plumbing.
-// Magic/version let an offline tool or debugger script locate and
-// interpret the block without requiring an exact struct-layout match.
 //
-#define STOR_TELEMETRY_MAGIC      0x53505331 // 'SPS1'
-#define STOR_TELEMETRY_VERSION    2
-#define STOR_TELEMETRY_HISTOGRAM_BUCKETS 64
-#define STOR_TELEMETRY_STATUS_SLOTS     64
+// The block is self-describing so that a snapshot (IOCTL), an offline tool or
+// a debugger script can interpret it without an exact struct-layout match:
+//
+//   [ header + adapter-wide fields ][ Queues[0] ] ... [ Queues[QueueCount-1] ]
+//   |<-------- HeaderSize -------->|<- QueueSize ->|
+//
+// Queues[] is deliberately the last member so that the first
+// HeaderSize + QueueCount * QueueSize bytes are a complete compact snapshot.
+// Layout rules:
+//   - Magic..Reserved never move.
+//   - New adapter-wide fields are appended after the last adapter-wide field
+//     (growing HeaderSize); new per-queue fields are appended to the end of
+//     QUEUE_TELEMETRY (growing QueueSize). Never reorder or remove fields.
+//   - Keep every field naturally aligned with explicit padding, so the layout
+//     is identical on x86 and x64 and parsers need no ABI knowledge.
+//   - Bump STOR_TELEMETRY_VERSION on any change.
+//
+#define STOR_TELEMETRY_MAGIC              0x53505331 // 'SPS1'
+#define STOR_TELEMETRY_VERSION            3
+#define STOR_TELEMETRY_HISTOGRAM_BUCKETS  64
+#define STOR_TELEMETRY_STATUS_SLOTS       64
 
 typedef struct _LATENCY_STATS
 {
@@ -322,14 +337,21 @@ typedef struct _QUEUE_TELEMETRY
     LATENCY_STATS Latency;
     ULONG64 StatusHistogram[STOR_TELEMETRY_STATUS_SLOTS]; // indexed by SRB_STATUS_* (flag bits masked off)
     ULONG InFlightHighWaterMark;
+    ULONG Reserved;         // explicit padding, keeps QueueFullCount 8-byte aligned on x86 too
     ULONG64 QueueFullCount; // virtqueue_add_buf() had no free descriptors
 } QUEUE_TELEMETRY, *PQUEUE_TELEMETRY;
 
 typedef struct _STOR_TELEMETRY
 {
+    // Header, see layout rules above.
     ULONG Magic;
     ULONG Version;
-    QUEUE_TELEMETRY Queues[MAX_CPU];
+    ULONG HeaderSize;     // FIELD_OFFSET(STOR_TELEMETRY, Queues)
+    ULONG QueueSize;      // sizeof(QUEUE_TELEMETRY)
+    ULONG QueueCount;     // number of valid Queues[] entries, == ADAPTER_EXTENSION.num_queues
+    ULONG LatencyBuckets; // STOR_TELEMETRY_HISTOGRAM_BUCKETS
+    ULONG StatusSlots;    // STOR_TELEMETRY_STATUS_SLOTS
+    ULONG Reserved;
 
     // Adapter-wide: resets aren't a per-queue event.
     ULONG64 BusResetCount;
@@ -337,10 +359,18 @@ typedef struct _STOR_TELEMETRY
     ULONG64 LogicalUnitResetCount;
     ULONG64 LastResetDurationUs;
     ULONG64 MaxResetDurationUs;
+    ULONG64 DeviceResetTmfInFlightCount; // DeviceReset() entered while a TMF was already in flight
 
-    // Version 2: DeviceReset() entered while a TMF was already in flight.
-    ULONG64 DeviceResetTmfInFlightCount;
+    // Must remain the last member.
+    QUEUE_TELEMETRY Queues[MAX_CPU];
 } STOR_TELEMETRY, *PSTOR_TELEMETRY;
+
+C_ASSERT(sizeof(LATENCY_STATS) % sizeof(ULONG64) == 0);
+C_ASSERT(sizeof(QUEUE_TELEMETRY) % sizeof(ULONG64) == 0);
+C_ASSERT(FIELD_OFFSET(QUEUE_TELEMETRY, QueueFullCount) % sizeof(ULONG64) == 0);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, BusResetCount) == 8 * sizeof(ULONG));
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) % sizeof(ULONG64) == 0);
+C_ASSERT(sizeof(STOR_TELEMETRY) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CPU * sizeof(QUEUE_TELEMETRY));
 
 FORCEINLINE ULONG
 StorPerfLatencyBucket(IN ULONGLONG ElapsedUs)
