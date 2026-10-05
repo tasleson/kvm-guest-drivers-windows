@@ -317,9 +317,12 @@ The per-target table is read from the adapter's full 256-entry table; only activ
 shown unless the second argument is 1. One difference from the live script: the driver works
 out each target's oldest in-flight request when it answers an IOCTL snapshot, so in a dump that
 value is shown as `OldestAtScan`, the request's age at the last scan (`never scanned` if no
-snapshot was ever taken), not against the dump time. A target is flagged `STALLED` when it has
-requests in flight and either nothing has completed for 5 seconds or more, or its oldest request
-was already that old at the last scan.
+snapshot was ever taken), not against the dump time. A target is flagged `STALLED` when it has requests in flight and its oldest request was already
+5 seconds old at the last scan. Without scan data for it (never scanned, or its request arrived
+after the scan) the script can only go by completions, so a target in flight that has not
+completed anything for 5 seconds or more, or ever, is reported as a `possible stall` and the
+warning says which evidence was used. A long-idle target whose oldest request was young at the
+scan is not flagged, as that request may simply be new.
 
 Symbols are optional:
 

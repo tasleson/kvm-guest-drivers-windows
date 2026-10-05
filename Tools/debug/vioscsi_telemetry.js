@@ -19,7 +19,8 @@
 //
 // Besides the per-queue view the script prints each active SCSI target (a target's requests span
 // all queues) with its in-flight count, last completion, latency, errors and resets, and flags
-// a target with requests in flight but no recent completion as STALLED. Per-target oldest
+// a target whose oldest request was already 5 s old at the last scan as STALLED (or, without
+// scan data, one that is in flight with no recent completion as a "possible stall"). Per-target oldest
 // in-flight ages are only as fresh as the driver's last IOCTL snapshot (it is computed there,
 // not on the I/O path), so a dump shows it "as of" that scan.
 //
@@ -229,28 +230,44 @@ function isTargetActive(t) {
     return !!(t.InFlight || t.Reads || t.Writes || t.Other || t.NoDevice || t.DeviceResets || t.LunResets);
 }
 
-// Adds ages and the stall verdict to each target. Last-completion time is kept current by the
-// I/O path, so a target with requests in flight and nothing completing for a while is stalled. The
-// oldest in-flight request is only computed when the driver takes an IOCTL snapshot, so it is
-// reported as its age at that scan (scanTime), not against "now": in a dump the request may have
-// completed since.
+// Adds ages and the stall verdict to each target. The oldest in-flight request is only computed
+// when the driver takes an IOCTL snapshot, so it is reported as its age at that scan (scanTime),
+// not against "now": in a dump the request may have completed since.
+//
+// Two levels of confidence, because "nothing completed for a while" alone proves little (the
+// request in flight may have been submitted a moment before the dump):
+//   Stalled       a request was already outstanding 5 s or more at the last scan (scan evidence).
+//   PossibleStall no scan evidence for this target (never scanned, or its request arrived after
+//                 the scan), and either nothing completed for 5 s or more, or nothing ever did.
+// A target whose oldest request was young at the scan is not flagged, however long ago its last
+// completion was. StallReason says which evidence was used.
 function summarizeTargets(targets, now, scanTime) {
     for (const t of targets) {
         t.LastCompletionAgeUs = ageUs(now, t.LastCompletionTime);
         t.MaxLatencyAgeUs = ageUs(now, t.MaxLatencyTime);
         t.LastResetAgeUs = ageUs(now, t.LastResetTime);
         t.OldestAtScanUs = (t.InFlight && scanTime) ? ageUs(scanTime, t.OldestInFlightTime) : null;
-        const reasons = [];
-        if (t.InFlight) {
-            if (t.LastCompletionAgeUs !== null && t.LastCompletionAgeUs >= STALL_WARN_US) {
-                reasons.push("no completion for " + fmtUs(t.LastCompletionAgeUs));
-            }
-            if (t.OldestAtScanUs !== null && t.OldestAtScanUs >= STALL_WARN_US) {
-                reasons.push("oldest request outstanding " + fmtUs(t.OldestAtScanUs) + " at the last scan");
-            }
+        t.Stalled = false;
+        t.PossibleStall = false;
+        t.StallReason = "";
+        if (!t.InFlight) {
+            continue;
         }
-        t.Stalled = reasons.length > 0;
-        t.StallReason = reasons.join("; ");
+        const idleFor = t.LastCompletionAgeUs !== null && t.LastCompletionAgeUs >= STALL_WARN_US;
+        if (t.OldestAtScanUs !== null) {
+            if (t.OldestAtScanUs >= STALL_WARN_US) {
+                t.Stalled = true;
+                t.StallReason = "oldest request outstanding " + fmtUs(t.OldestAtScanUs) + " at the last scan" +
+                    (idleFor ? ", no completion for " + fmtUs(t.LastCompletionAgeUs) : "");
+            }
+        } else if (!t.LastCompletionTime) {
+            t.PossibleStall = true;
+            t.StallReason = "in flight, never completed (no scan data for its oldest request)";
+        } else if (idleFor) {
+            t.PossibleStall = true;
+            t.StallReason = "no completion for " + fmtUs(t.LastCompletionAgeUs) +
+                " (no scan data for its oldest request, so it may be recent)";
+        }
     }
 }
 
@@ -928,7 +945,7 @@ const STALL_COLUMNS = [
 
 const TARGET_COLUMNS = [
     { name: "Target", value: r => r.Target },
-    { name: "State", value: r => r.Stalled ? "STALLED" : "" },
+    { name: "State", value: r => r.Stalled ? "STALLED" : r.PossibleStall ? "possible stall" : "" },
     { name: "InFlight", value: r => r.InFlight },
     { name: "OldestAtScan", value: r => fmtUs(r.OldestAtScanUs) },
     { name: "LastCompletion", value: r => fmtAgo(r.LastCompletionAgeUs) },
@@ -972,8 +989,9 @@ function printTargets(a, showAll) {
     log("Per target errors and resets:");
     fmtTable(TARGET_ERROR_COLUMNS, targets);
     for (const t of targets) {
-        if (t.Stalled) {
-            log("WARNING: target " + t.Target + " has " + t.InFlight + " request(s) in flight, " + t.StallReason);
+        if (t.Stalled || t.PossibleStall) {
+            log("WARNING: target " + t.Target + " has " + t.InFlight + " request(s) in flight, " +
+                (t.Stalled ? "STALLED: " : "possible stall (low confidence): ") + t.StallReason);
         }
     }
 }
