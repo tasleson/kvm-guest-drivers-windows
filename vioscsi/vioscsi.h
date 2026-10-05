@@ -263,7 +263,7 @@ typedef struct _SRB_EXTENSION
     ULONGLONG time;
     ULONG_PTR id;
     ULONG QueueIndex;     // index into ADAPTER_EXTENSION.processing_srbs / Telemetry.Queues, set by SendSRB
-    ULONGLONG SubmitTime; // StorPerfInterruptTime() when queued to the virtqueue, 0 if unknown; feeds OldestInFlightTime
+    ULONGLONG SubmitTime; // StorPerfInterruptTime() when queued, 0 if never submitted; feeds OldestInFlightTime
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
 
@@ -356,7 +356,10 @@ typedef struct _QUEUE_TELEMETRY
     ULONG Reserved;         // explicit padding, keeps QueueFullCount 8-byte aligned on x86 too
     ULONG64 QueueFullCount; // virtqueue_add_buf() had no free descriptors
 
-    // Added in version 4.
+    // Added in version 4. Read without a lock by TelemetryRequest, so the 64-bit tearing noted
+    // there applies to these too. OldestInFlightTime comes from SRB_EXTENSION.SubmitTime, which is
+    // stamped after the latency clock (SRB_EXTENSION.time), so it can read slightly younger than
+    // the latency of a slow request.
     ULONG64 OldestInFlightTime; // SubmitTime of the oldest request still on the virtqueue, 0 if none
     ULONG64 LastCompletionTime; // when the last request completed on this queue
     ULONG64 MaxLatencyTime;     // when Latency.MaxUs was last raised

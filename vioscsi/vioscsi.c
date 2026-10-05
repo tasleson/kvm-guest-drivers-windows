@@ -1410,6 +1410,7 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
                         {
                             SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_NO_DEVICE);
                             SRB_SET_DATA_TRANSFER_LENGTH(currSrb, 0);
+                            currSrbExt->SubmitTime = 0; // not a device completion, keep it out of latency stats
                             CompleteRequest(DeviceExtension, (PSRB_TYPE)currSrb);
                             RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                                          " Complete pending I/Os on Path %d Target %d Lun %d \n",
@@ -1530,6 +1531,10 @@ VioScsiBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     }
     srbExt->in = sgElement - srbExt->out;
 
+    // The SRB extension is reused: clear what a previous request left so a request that never
+    // reaches the virtqueue isn't treated as submitted (see RecordIoCompletionStats).
+    srbExt->time = 0;
+    srbExt->SubmitTime = 0;
     {
         LARGE_INTEGER counter = {0};
         ULONG status = STOR_STATUS_SUCCESS;
@@ -1702,6 +1707,7 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
                     {
                         SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_BUS_RESET);
                         SRB_SET_DATA_TRANSFER_LENGTH(currSrb, 0);
+                        currSrbExt->SubmitTime = 0; // not a device completion, keep it out of latency stats
                         CompleteRequest(DeviceExtension, (PSRB_TYPE)currSrb);
                         element->srb_cnt--;
                     }
@@ -1943,26 +1949,38 @@ RecordIoCompletionStats(IN PADAPTER_EXTENSION adaptExt, IN PSRB_TYPE Srb, IN PSR
     queueStats = &adaptExt->Telemetry.Queues[srbExt->QueueIndex];
     dataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
 
-    bucket = StorPerfLatencyBucket(ElapsedUs);
-    InterlockedIncrement64((PLONG64)&queueStats->Latency.Buckets[bucket]);
-    InterlockedIncrement64((PLONG64)&queueStats->Latency.Count);
-    InterlockedExchangeAdd64((PLONG64)&queueStats->Latency.SumUs, (LONG64)ElapsedUs);
-    StorPerfUpdateMin(&queueStats->Latency.MinUs, ElapsedUs);
-    now = StorPerfInterruptTime(adaptExt);
-    if (StorPerfUpdateMax(&queueStats->Latency.MaxUs, ElapsedUs))
+    // Latency, slow-request and last-completion state describe the device, so only requests that
+    // were actually queued to the virtqueue (SubmitTime set by SendSRB) feed them. Completions
+    // made without the device (queue full -> BUSY, bRemoved, reset, surprise removal) would
+    // otherwise refresh LastCompletionTime and hide a real stall. The read/write counters and
+    // status histogram below still count every completion: they record what the initiator was
+    // told, and the BUSY/BUS_RESET/NO_DEVICE slots are useful there.
+    // The latency clock (srbExt->time, stamped in BuildIo) starts earlier than SubmitTime
+    // (stamped after virtqueue_add_buf), so an oldest-in-flight age can be slightly smaller
+    // than the latency of a slow request.
+    if (srbExt->SubmitTime != 0)
     {
-        InterlockedExchange64((PLONG64)&queueStats->MaxLatencyTime, (LONG64)now);
-    }
-    InterlockedExchange64((PLONG64)&queueStats->LastCompletionTime, (LONG64)now);
-    if (ElapsedUs > STOR_TELEMETRY_SLOW_1S_US)
-    {
-        InterlockedIncrement64((PLONG64)&queueStats->Slow1sCount);
-        if (ElapsedUs > STOR_TELEMETRY_SLOW_5S_US)
+        bucket = StorPerfLatencyBucket(ElapsedUs);
+        InterlockedIncrement64((PLONG64)&queueStats->Latency.Buckets[bucket]);
+        InterlockedIncrement64((PLONG64)&queueStats->Latency.Count);
+        InterlockedExchangeAdd64((PLONG64)&queueStats->Latency.SumUs, (LONG64)ElapsedUs);
+        StorPerfUpdateMin(&queueStats->Latency.MinUs, ElapsedUs);
+        now = StorPerfInterruptTime(adaptExt);
+        if (StorPerfUpdateMax(&queueStats->Latency.MaxUs, ElapsedUs))
         {
-            InterlockedIncrement64((PLONG64)&queueStats->Slow5sCount);
-            if (ElapsedUs > STOR_TELEMETRY_SLOW_30S_US)
+            InterlockedExchange64((PLONG64)&queueStats->MaxLatencyTime, (LONG64)now);
+        }
+        InterlockedExchange64((PLONG64)&queueStats->LastCompletionTime, (LONG64)now);
+        if (ElapsedUs > STOR_TELEMETRY_SLOW_1S_US)
+        {
+            InterlockedIncrement64((PLONG64)&queueStats->Slow1sCount);
+            if (ElapsedUs > STOR_TELEMETRY_SLOW_5S_US)
             {
-                InterlockedIncrement64((PLONG64)&queueStats->Slow30sCount);
+                InterlockedIncrement64((PLONG64)&queueStats->Slow5sCount);
+                if (ElapsedUs > STOR_TELEMETRY_SLOW_30S_US)
+                {
+                    InterlockedIncrement64((PLONG64)&queueStats->Slow30sCount);
+                }
             }
         }
     }
