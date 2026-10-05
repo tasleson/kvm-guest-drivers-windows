@@ -7,7 +7,7 @@ This directory contains diagnostic tools for Windows guest systems running virti
 - **CollectSystemInfo.ps1** - Comprehensive diagnostics bundle (1-5 minutes)
 - **GetVirtioWinInfo.ps1** - Quick version check and reboot status (~5 seconds)
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics from WinPE/WinRE
-- **GetVioScsiTelemetry.ps1** - vioscsi per-queue I/O, latency and error counters from a running system
+- **GetVioScsiTelemetry.ps1** - vioscsi per-queue and per-target I/O, latency and error counters from a running system
 - **vioscsi_telemetry.js** - WinDbg script showing the same vioscsi counters from a kernel crash dump
 
 ---
@@ -250,7 +250,26 @@ and bytes, a log2 latency histogram with min/max/average, a histogram of SRB com
 statuses, the in-flight high-water mark, the number of times a virtqueue was full, and
 adapter-wide reset counts and durations. This script reads it from every vioscsi adapter
 with an `IOCTL_SCSI_MINIPORT` request and prints a summary. It needs a vioscsi driver
-with telemetry version 3 or later, and must be run as Administrator.
+with telemetry version 5 or later, and must be run as Administrator.
+
+For chasing storage timeouts there are per-queue stall indicators: the number of
+requests in flight now, the age of the oldest one, the time since the last completion, the
+time the maximum latency was seen, and counts of requests slower than 1s, 5s and 30s, plus
+the time since the last reset. The latency figures only cover requests that completed, so a
+request that never returns shows up only as a large oldest-in-flight age (the script prints
+a warning for 5s or more). Ages are relative to the moment the driver took the snapshot.
+
+A target's requests are spread over all queues, so with several targets on one adapter the
+queue tables cannot say which disk has the problem. A per-target section lists each active
+SCSI target (one that has seen any I/O, refusal or reset; `-All` also lists entries without
+activity) with the same stall indicators and latency figures, plus counts of completions
+that ended BUSY, ABORTED/BUS_RESET, NO_DEVICE, other errors or INVALID_TARGET_ID, and
+device and LUN resets addressed to that target. A target with requests in flight whose
+oldest request has been outstanding for 5 seconds or more is marked `STALLED`. Requests
+the driver refuses for a target ID the device doesn't have cannot be attributed to a
+target and are reported once per adapter. The oldest in-flight request per target is
+computed by the driver when it answers this query (it would need a lock shared by all
+queues to keep it up to date on the I/O path), so it is exact in this live view.
 
 Counters accumulate from when the adapter was started and cannot be cleared, so compare
 two snapshots to see what changed over an interval. Latency percentiles are upper bounds of
@@ -260,12 +279,15 @@ the histogram bucket they fall in (buckets double in width).
 
 ```powershell
 .\GetVioScsiTelemetry.ps1                  # summary of every vioscsi adapter
-.\GetVioScsiTelemetry.ps1 -All             # include queues with no completed requests
+.\GetVioScsiTelemetry.ps1 -All             # include queues with no completed requests and idle targets
 .\GetVioScsiTelemetry.ps1 -Port 2          # only \\.\Scsi2:
-.\GetVioScsiTelemetry.ps1 -PassThru        # objects (incl. raw histograms) for further processing
+.\GetVioScsiTelemetry.ps1 -PassThru        # objects (Queues, Targets, raw histograms) for further processing
 .\GetVioScsiTelemetry.ps1 -SaveRaw C:\temp # also save each raw snapshot as a .bin file
 .\GetVioScsiTelemetry.ps1 -InputFile C:\temp\vioscsi-telemetry-scsi2-20261005-101500.bin
 ```
+
+Stalled targets can also be picked out of the objects:
+`(.\GetVioScsiTelemetry.ps1 -PassThru)[0].Targets | Where-Object Stalled`.
 
 `-InputFile` parses a saved snapshot without talking to the driver, so a `.bin`
 collected from a guest can be examined elsewhere (Windows PowerShell 5.1 or PowerShell 7).
@@ -284,6 +306,23 @@ session, in the same format as the PowerShell script. vioscsi lists its started 
 The telemetry lives in the adapter's device extension in nonpaged pool, so it is only
 present in **kernel, automatic or complete memory dumps**. Small memory dumps (minidumps)
 don't contain it.
+
+The stall indicators are included. Their ages are measured against the interrupt
+time at the moment of the dump (read from `KUSER_SHARED_DATA`), so "oldest in flight 60s"
+means a request had been outstanding that long when the system crashed. If that page isn't in
+the dump, the script falls back to the time of the driver's last IOCTL snapshot and says that
+the ages may be understated.
+
+The per-target table is read from the adapter's full 256-entry table; only active targets are
+shown unless the second argument is 1. One difference from the live script: the driver works
+out each target's oldest in-flight request when it answers an IOCTL snapshot, so in a dump that
+value is shown as `OldestAtScan`, the request's age at the last scan (`never scanned` if no
+snapshot was ever taken), not against the dump time. A target is flagged `STALLED` when it has requests in flight and its oldest request was already
+5 seconds old at the last scan. Without scan data for it (never scanned, or its request arrived
+after the scan) the script can only go by completions, so a target in flight that has not
+completed anything for 5 seconds or more, or ever, is reported as a `possible stall` and the
+warning says which evidence was used. A long-idle target whose oldest request was young at the
+scan is not flagged, as that request may simply be new.
 
 Symbols are optional:
 
@@ -304,11 +343,12 @@ Symbols are optional:
 .scriptload C:\path\to\vioscsi_telemetry.js
 !vioscsi_telemetry                       # every registered vioscsi adapter
 !vioscsi_telemetry <adapter extension>   # one adapter, by its miniport device extension address
-!vioscsi_telemetry 0 1                   # all adapters, including queues with no completions
+!vioscsi_telemetry 0 1                   # all adapters, including idle queues and targets
 !vioscsi_telemetry_at <address> [1]      # parse the STOR_TELEMETRY at a known address
 !vioscsi_telemetry_scan <start> <len> [1]  # scan a range for STOR_TELEMETRY blocks
 dx @$vioscsiTelemetry()                  # the same data as debugger data model objects
 dx -r3 @$vioscsiTelemetry()[0].Queues    # per-queue values including raw histograms
+dx @$vioscsiTelemetry()[0].Targets       # per-target values (active targets)
 ```
 
 `dx @$vioscsiTelemetryAt(<address>)` and `dx @$vioscsiTelemetryScan(<start>, <len>)` return
