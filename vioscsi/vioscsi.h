@@ -297,7 +297,7 @@ typedef struct _REQUEST_LIST
 // interpret the block without requiring an exact struct-layout match.
 //
 #define STOR_TELEMETRY_MAGIC      0x53505331 // 'SPS1'
-#define STOR_TELEMETRY_VERSION    1
+#define STOR_TELEMETRY_VERSION    2
 #define STOR_TELEMETRY_HISTOGRAM_BUCKETS 64
 #define STOR_TELEMETRY_STATUS_SLOTS     64
 
@@ -337,6 +337,9 @@ typedef struct _STOR_TELEMETRY
     ULONG64 LogicalUnitResetCount;
     ULONG64 LastResetDurationUs;
     ULONG64 MaxResetDurationUs;
+
+    // Version 2: DeviceReset() entered while a TMF was already in flight.
+    ULONG64 DeviceResetTmfInFlightCount;
 } STOR_TELEMETRY, *PSTOR_TELEMETRY;
 
 FORCEINLINE ULONG

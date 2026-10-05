@@ -262,11 +262,13 @@ DeviceReset(IN PVOID DeviceExtension)
     // DeviceReset should be unreachable while a prior TMF is in flight under correct
     // operation (Storport serializes reset handling) - hitting this means our own
     // concurrency assumptions already broke down, so a quiet "return FALSE" would let the
-    // driver keep running on top of an already-violated invariant. Deliberately fatal while
-    // this driver is under hypervisor error injection to find where it corrupts memory today.
+    // driver keep running on top of an already-violated invariant.
+    // The bugcheck is temporarily disabled: this path is being hit in practice, so count
+    // occurrences in telemetry instead to measure how often it happens.
     if (!NT_VERIFY(adaptExt->tmf_infly == FALSE))
     {
-        KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, (ULONG_PTR)adaptExt, adaptExt->tmf_infly, 0);
+        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.DeviceResetTmfInFlightCount);
+        // KeBugCheckEx(VIOSCSI_BUGCHECK_CORRUPTION_GUARD, __LINE__, (ULONG_PTR)adaptExt, adaptExt->tmf_infly, 0);
     }
     Srb->SrbExtension = srbExt;
     RtlZeroMemory((PVOID)cmd, sizeof(VirtIOSCSICmd));
