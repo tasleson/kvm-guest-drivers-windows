@@ -7,12 +7,16 @@
     request and prints a summary of the driver's STOR_TELEMETRY block: reset counts,
     then per-queue I/O counts, bytes, latency (avg/min/max and approximate p50/p99 from
     the log2 histogram), in-flight high-water mark and queue-full count, and a
-    non-zero SRB status histogram. Counters are cumulative since the adapter was
-    started; take two snapshots to compute rates.
+    non-zero SRB status histogram. Telemetry version 4 or later adds stall indicators:
+    the in-flight count, the age of the oldest in-flight request, the time since the last
+    completion, counts of requests slower than 1s/5s/30s, and the time since the last
+    reset. A request that never completes is not in the latency figures, so look at the
+    oldest in-flight age when chasing storage timeouts. Counters are cumulative since the
+    adapter was started; take two snapshots to compute rates.
 
     Requires Administrator rights and a vioscsi driver with telemetry version 3 or
-    later. A blob saved with -SaveRaw can be parsed later, on any machine, with
-    -InputFile.
+    later (version 4 for the stall indicators). A blob saved with -SaveRaw can be parsed
+    later, on any machine, with -InputFile.
 
 .PARAMETER Port
     Query only these \\.\ScsiN: port numbers instead of every vioscsi adapter.
@@ -86,6 +90,14 @@ $STOR_TELEMETRY_MIN_VERSION     = 3
 # LatencyBuckets, StatusSlots, Reserved (8 ULONGs), then the adapter-wide ULONG64s.
 $HEADER_FIXED_SIZE              = 32
 $HEADER_V3_SIZE                 = 80
+$HEADER_V4_SIZE                 = 96
+# Version 4 appends 56 bytes to each queue: OldestInFlightTime, LastCompletionTime,
+# MaxLatencyTime, Slow1s/5s/30sCount (ULONG64s), InFlightCount and a ULONG of padding.
+$QUEUE_V4_EXTRA_SIZE            = 56
+# Timestamps are interrupt time in 100 ns units; ages are taken against SnapshotTime.
+$HNS_PER_US                     = 10
+# A request outstanding this long is flagged in the summary.
+$STALL_WARN_US                  = 5000000
 $INITIAL_QUERY_SIZE             = 4096
 $IOCTL_TIMEOUT_SEC              = 10
 
@@ -225,6 +237,14 @@ function Get-HistogramPercentileUs([uint64[]]$Buckets, [double]$Fraction) {
     return [math]::Pow(2, $Buckets.Length)
 }
 
+function Get-AgeUs($Now, $Then) {
+    # Timestamps are interrupt time in 100 ns units, 0 meaning never/none. A request queued just
+    # after the snapshot time was taken can be slightly newer than it, so clamp to 0.
+    if (-not $Now -or -not $Then) { return $null }
+    if ($Then -ge $Now) { return [uint64]0 }
+    return [uint64][math]::Floor(($Now - $Then) / $HNS_PER_US)
+}
+
 function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
     if ($Data.Length -lt $HEADER_FIXED_SIZE) {
         throw "${Source}: snapshot is only $($Data.Length) bytes, too short for a telemetry header"
@@ -248,7 +268,11 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
     $offStatus = $offLatencyCount + 32
     $offHwm = $offStatus + 8 * $statusSlots
     $offQueueFull = $offHwm + 8
-    if ($headerSize -lt $HEADER_V3_SIZE -or $queueSize -lt ($offQueueFull + 8) -or $Data.Length -lt $headerSize) {
+    $offV4 = $offQueueFull + 8
+    $hasV4 = $version -ge 4
+    $minHeader = $(if ($hasV4) { $HEADER_V4_SIZE } else { $HEADER_V3_SIZE })
+    $minQueue = $(if ($hasV4) { $offV4 + $QUEUE_V4_EXTRA_SIZE } else { $offV4 })
+    if ($headerSize -lt $minHeader -or $queueSize -lt $minQueue -or $Data.Length -lt $headerSize) {
         throw "${Source}: inconsistent telemetry header (HeaderSize=$headerSize QueueSize=$queueSize, $($Data.Length) bytes)"
     }
     $available = [uint32][math]::Floor(($Data.Length - $headerSize) / $queueSize)
@@ -265,11 +289,25 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
         ,$a
     }
 
+    # Version 4 timestamps; ages are relative to the time the driver took the snapshot.
+    $snapshotTime = $(if ($hasV4) { & $u64 88 } else { [uint64]0 })
+
     $queues = for ($q = 0; $q -lt $queueCount; $q++) {
         $base = $headerSize + $q * $queueSize
         $buckets = & $u64Array ($base + 56) $latencyBuckets
         $count = & $u64 ($base + $offLatencyCount)
         $sum = & $u64 ($base + $offLatencyCount + 8)
+        $stall = [ordered]@{ InFlight = $null; OldestInFlightAgeUs = $null; LastCompletionAgeUs = $null
+                             MaxLatencyAgeUs = $null; Slow1s = $null; Slow5s = $null; Slow30s = $null }
+        if ($hasV4) {
+            $stall.InFlight = [BitConverter]::ToUInt32($Data, $base + $offV4 + 48)
+            $stall.OldestInFlightAgeUs = Get-AgeUs $snapshotTime (& $u64 ($base + $offV4))
+            $stall.LastCompletionAgeUs = Get-AgeUs $snapshotTime (& $u64 ($base + $offV4 + 8))
+            $stall.MaxLatencyAgeUs = Get-AgeUs $snapshotTime (& $u64 ($base + $offV4 + 16))
+            $stall.Slow1s = & $u64 ($base + $offV4 + 24)
+            $stall.Slow5s = & $u64 ($base + $offV4 + 32)
+            $stall.Slow30s = & $u64 ($base + $offV4 + 40)
+        }
         [PSCustomObject]@{
             Queue           = $q
             Reads           = & $u64 ($base + 0)
@@ -288,6 +326,13 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
             P99Us           = Get-HistogramPercentileUs $buckets 0.99
             InFlightHwm     = [BitConverter]::ToUInt32($Data, $base + $offHwm)
             QueueFull       = & $u64 ($base + $offQueueFull)
+            InFlight            = $stall.InFlight
+            OldestInFlightAgeUs = $stall.OldestInFlightAgeUs
+            LastCompletionAgeUs = $stall.LastCompletionAgeUs
+            MaxLatencyAgeUs     = $stall.MaxLatencyAgeUs
+            Slow1s              = $stall.Slow1s
+            Slow5s              = $stall.Slow5s
+            Slow30s             = $stall.Slow30s
             LatencyBuckets  = $buckets
             StatusHistogram = & $u64Array ($base + $offStatus) $statusSlots
         }
@@ -300,11 +345,30 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
     $total = [ordered]@{ Queue = 'Total'; Reads = [uint64]0; Writes = [uint64]0; Flushes = [uint64]0; Unmaps = [uint64]0
                          Other = [uint64]0; ReadBytes = [uint64]0; WriteBytes = [uint64]0; Completions = [uint64]0
                          LatencySumUs = [uint64]0; MinUs = [uint64]0; MaxUs = [uint64]0; InFlightHwm = [uint32]0
-                         QueueFull = [uint64]0 }
+                         QueueFull = [uint64]0
+                         InFlight = $null; OldestInFlightAgeUs = $null; LastCompletionAgeUs = $null
+                         MaxLatencyAgeUs = $null; Slow1s = $null; Slow5s = $null; Slow30s = $null }
+    if ($hasV4) {
+        $total.InFlight = [uint64]0; $total.Slow1s = [uint64]0; $total.Slow5s = [uint64]0; $total.Slow30s = [uint64]0
+    }
     foreach ($q in $queues) {
         foreach ($f in 'Reads', 'Writes', 'Flushes', 'Unmaps', 'Other', 'ReadBytes', 'WriteBytes', 'Completions',
                        'LatencySumUs', 'QueueFull') {
             $total[$f] += $q.$f
+        }
+        if ($hasV4) {
+            foreach ($f in 'InFlight', 'Slow1s', 'Slow5s', 'Slow30s') { $total[$f] += $q.$f }
+            # Oldest request: the largest age. Last completion: the smallest age (most recent).
+            if ($null -ne $q.OldestInFlightAgeUs -and
+                ($null -eq $total.OldestInFlightAgeUs -or $q.OldestInFlightAgeUs -gt $total.OldestInFlightAgeUs)) {
+                $total.OldestInFlightAgeUs = $q.OldestInFlightAgeUs
+            }
+            if ($null -ne $q.LastCompletionAgeUs -and
+                ($null -eq $total.LastCompletionAgeUs -or $q.LastCompletionAgeUs -lt $total.LastCompletionAgeUs)) {
+                $total.LastCompletionAgeUs = $q.LastCompletionAgeUs
+            }
+            # The max latency time belongs to the queue holding the overall max.
+            if ($q.MaxUs -gt $total.MaxUs) { $total.MaxLatencyAgeUs = $q.MaxLatencyAgeUs }
         }
         if ($q.MinUs -and (-not $total.MinUs -or $q.MinUs -lt $total.MinUs)) { $total.MinUs = $q.MinUs }
         if ($q.MaxUs -gt $total.MaxUs) { $total.MaxUs = $q.MaxUs }
@@ -336,6 +400,7 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
         LastResetDurationUs         = & $u64 56
         MaxResetDurationUs          = & $u64 64
         DeviceResetTmfInFlightCount = & $u64 72
+        LastResetAgeUs              = $(if ($hasV4) { Get-AgeUs $snapshotTime (& $u64 80) } else { $null })
         Queues                      = $queues
         Total                       = [PSCustomObject]$total
         Status                      = [PSCustomObject]$status
@@ -350,12 +415,16 @@ function Format-Us($Us) {
 }
 
 function Write-TelemetrySummary($T) {
-    $rows = @($T.Queues | Where-Object { $All -or $_.Completions -or $_.QueueFull }) + $T.Total
+    $rows = @($T.Queues | Where-Object { $All -or $_.Completions -or $_.QueueFull -or $_.InFlight }) + $T.Total
     Write-Host ''
     Write-Host ("== {0}  (telemetry v{1}, {2} queues)" -f $T.Source, $T.Version, $T.QueueCount)
     Write-Host ("Resets: bus {0}, device {1}, LUN {2}; last {3}, max {4}; DeviceReset with TMF in flight {5}" -f
                 $T.BusResetCount, $T.DeviceResetCount, $T.LogicalUnitResetCount,
                 (Format-Us $T.LastResetDurationUs), (Format-Us $T.MaxResetDurationUs), $T.DeviceResetTmfInFlightCount)
+    if ($T.Version -ge 4) {
+        $lastReset = $(if ($null -ne $T.LastResetAgeUs) { "$(Format-Us $T.LastResetAgeUs) ago" } else { 'never' })
+        Write-Host ("Last reset: {0}" -f $lastReset)
+    }
     $rows | Format-Table -AutoSize -Property Queue, Reads, Writes, Flushes, Unmaps, Other,
         @{ n = 'ReadMB'; e = { '{0:N1}' -f ($_.ReadBytes / 1MB) }; a = 'right' },
         @{ n = 'WriteMB'; e = { '{0:N1}' -f ($_.WriteBytes / 1MB) }; a = 'right' },
@@ -366,6 +435,24 @@ function Write-TelemetrySummary($T) {
         @{ n = 'p99<='; e = { Format-Us $_.P99Us }; a = 'right' },
         @{ n = 'HWM'; e = { $_.InFlightHwm } },
         @{ n = 'QFull'; e = { $_.QueueFull } } | Out-Host
+    if ($T.Version -ge 4) {
+        Write-Host ''
+        Write-Host 'Stall indicators (ages are relative to the snapshot time):'
+        $rows | Format-Table -AutoSize -Property Queue,
+            @{ n = 'InFlight'; e = { $_.InFlight } },
+            @{ n = 'OldestInFlight'; e = { Format-Us $_.OldestInFlightAgeUs }; a = 'right' },
+            @{ n = 'LastCompletion'; e = { $(if ($null -ne $_.LastCompletionAgeUs) { "$(Format-Us $_.LastCompletionAgeUs) ago" } else { '-' }) }; a = 'right' },
+            @{ n = 'MaxLatencyAt'; e = { $(if ($null -ne $_.MaxLatencyAgeUs) { "$(Format-Us $_.MaxLatencyAgeUs) ago" } else { '-' }) }; a = 'right' },
+            @{ n = '>1s'; e = { $_.Slow1s } },
+            @{ n = '>5s'; e = { $_.Slow5s } },
+            @{ n = '>30s'; e = { $_.Slow30s } } | Out-Host
+        foreach ($q in $T.Queues) {
+            if ($q.InFlight -and $null -ne $q.OldestInFlightAgeUs -and $q.OldestInFlightAgeUs -ge $STALL_WARN_US) {
+                Write-Host ("WARNING: queue {0} has {1} request(s) in flight, the oldest for {2}" -f
+                            $q.Queue, $q.InFlight, (Format-Us $q.OldestInFlightAgeUs)) -ForegroundColor Yellow
+            }
+        }
+    }
     $statusText = ($T.Status.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
     Write-Host ("SRB status: {0}" -f $(if ($statusText) { $statusText } else { '(none)' }))
 }

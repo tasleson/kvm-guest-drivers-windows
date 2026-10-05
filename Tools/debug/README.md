@@ -250,7 +250,15 @@ and bytes, a log2 latency histogram with min/max/average, a histogram of SRB com
 statuses, the in-flight high-water mark, the number of times a virtqueue was full, and
 adapter-wide reset counts and durations. This script reads it from every vioscsi adapter
 with an `IOCTL_SCSI_MINIPORT` request and prints a summary. It needs a vioscsi driver
-with telemetry version 3 or later, and must be run as Administrator.
+with telemetry version 3 or later (version 4 for the stall indicators below), and must be
+run as Administrator.
+
+For chasing storage timeouts, version 4 adds per-queue stall indicators: the number of
+requests in flight now, the age of the oldest one, the time since the last completion, the
+time the maximum latency was seen, and counts of requests slower than 1s, 5s and 30s, plus
+the time since the last reset. The latency figures only cover requests that completed, so a
+request that never returns shows up only as a large oldest-in-flight age (the script prints
+a warning for 5s or more). Ages are relative to the moment the driver took the snapshot.
 
 Counters accumulate from when the adapter was started and cannot be cleared, so compare
 two snapshots to see what changed over an interval. Latency percentiles are upper bounds of
