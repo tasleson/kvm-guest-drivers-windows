@@ -59,6 +59,7 @@ const VIOSCSI_TELEMETRY_DIRECTORY_MAGIC = 0x44545356; // 'VSTD'
 // StatusSlots, Reserved (8 ULONGs), then the six adapter-wide ULONG64s.
 const HEADER_ULONGS = 8;
 const HEADER_V3_SIZE = 80;
+const HEADER_V4_SIZE = 96; // v4 adds LastResetTime and SnapshotTime after the six fields below
 const RESET_FIELDS = ["BusResetCount", "DeviceResetCount", "LogicalUnitResetCount", "LastResetDurationUs",
                       "MaxResetDurationUs", "DeviceResetTmfInFlightCount"];
 // QUEUE_TELEMETRY, in ULONG64 slots: 7 counters, Buckets[B], Count/SumUs/MinUs/MaxUs,
@@ -66,8 +67,18 @@ const RESET_FIELDS = ["BusResetCount", "DeviceResetCount", "LogicalUnitResetCoun
 const QUEUE_COUNTER_SLOTS = 7;
 const QUEUE_LATENCY_SLOTS = 4;
 const QUEUE_TRAILER_SLOTS = 2;
+// v4 appends six ULONG64s (OldestInFlightTime, LastCompletionTime, MaxLatencyTime, Slow1sCount,
+// Slow5sCount, Slow30sCount) and one slot of InFlightCount + Reserved2 (two ULONGs).
+const QUEUE_V4_SLOTS = 7;
+// Timestamps are interrupt time in 100 ns units. In a dump or live session "now" is that same
+// clock read from KUSER_SHARED_DATA (InterruptTime is a KSYSTEM_TIME at offset 8).
+const HNS_PER_US = 10;
+const KUSER_SHARED_DATA_ADDRESSES = ["fffff78000000000", "ffdf0000"]; // x64/arm64, x86 (hex)
+const KUSER_INTERRUPT_TIME_OFFSET = 8;
+// A request outstanding this long is flagged in the summary.
+const STALL_WARN_US = 5000000;
 // Sanity bounds for header-described sizes in the raw path, so a corrupt header can't make
-// the script read megabytes per queue. v3 uses HeaderSize 80 and QueueSize 1128.
+// the script read megabytes per queue. v3 uses HeaderSize 80 and QueueSize 1128, v4 96 and 1184.
 const RAW_MAX_ARRAY_SLOTS = 256;
 const RAW_MAX_HEADER_SIZE = 4 * 1024;
 const RAW_MAX_QUEUE_SIZE = 64 * 1024;
@@ -94,6 +105,7 @@ const SRB_STATUS_NAMES = {
     0x25: "LINK_DOWN", 0x26: "INSUFFICIENT_RESOURCES", 0x27: "THROTTLED_REQUEST", 0x30: "INTERNAL_ERROR"
 };
 
+const V4_COUNTER_FIELDS = ["InFlight", "Slow1s", "Slow5s", "Slow30s"];
 const COUNTER_FIELDS = ["Reads", "Writes", "Flushes", "Unmaps", "Other", "ReadBytes", "WriteBytes",
                         "Completions", "LatencySumUs", "QueueFull"];
 
@@ -155,6 +167,35 @@ function readArray(arr, count) {
     return out;
 }
 
+// Current interrupt time (100 ns units) of the target, from KUSER_SHARED_DATA, or null if the
+// page isn't available (e.g. not captured in the dump).
+function readInterruptTimeHns() {
+    for (const base of KUSER_SHARED_DATA_ADDRESSES) {
+        try {
+            const address = host.parseInt64(base, 16).add(KUSER_INTERRUPT_TIME_OFFSET);
+            for (let attempt = 0; attempt < 3; attempt++) {
+                // KSYSTEM_TIME: LowPart, High1Time, High2Time; equal highs mean a consistent read.
+                const t = readValues(address, 3, 4).map(low32);
+                if (t[1] === t[2]) {
+                    return t[1] * 4294967296 + t[0];
+                }
+            }
+        } catch (e) {
+            // Try the next layout.
+        }
+    }
+    return null;
+}
+
+// Microseconds from a timestamp to now; null if the timestamp is unset (0), clamped to 0 if it
+// is slightly newer than now (a request queued just after the reference time was taken).
+function ageUs(now, then) {
+    if (!now || !then) {
+        return null;
+    }
+    return then >= now ? 0 : Math.floor((now - then) / HNS_PER_US);
+}
+
 function addLatencyStats(row) {
     row.AvgUs = row.Completions ? Math.round((row.LatencySumUs / row.Completions) * 10) / 10 : null;
     row.P50Us = percentileUs(row.LatencyBuckets, 0.50);
@@ -167,10 +208,46 @@ function addLatencyStats(row) {
 function summarize(source, header, queues, typed) {
     const total = { Queue: "Total", MinUs: 0, MaxUs: 0, InFlightHwm: 0 };
     COUNTER_FIELDS.forEach(f => total[f] = 0);
+    // Version 4 stall indicators. "Now" is the target's current interrupt time when it can be
+    // read; otherwise the time of the driver's last IOCTL snapshot, which may be long before a dump.
+    let now = null;
+    let nowSource = null;
+    if (header.HasV4) {
+        now = readInterruptTimeHns();
+        if (now) {
+            nowSource = "dump/session interrupt time";
+        } else if (header.SnapshotTime) {
+            now = header.SnapshotTime;
+            nowSource = "last IOCTL snapshot time (current time unavailable, ages may be understated)";
+        }
+        V4_COUNTER_FIELDS.forEach(f => total[f] = 0);
+        total.OldestInFlightAgeUs = null;
+        total.LastCompletionAgeUs = null;
+        total.MaxLatencyAgeUs = null;
+    }
     total.LatencyBuckets = new Array(header.LatencyBuckets).fill(0);
     total.StatusHistogram = new Array(header.StatusSlots).fill(0);
     for (const q of queues) {
         COUNTER_FIELDS.forEach(f => total[f] += q[f]);
+        if (header.HasV4) {
+            V4_COUNTER_FIELDS.forEach(f => total[f] += q[f]);
+            q.OldestInFlightAgeUs = ageUs(now, q.OldestInFlightTime);
+            q.LastCompletionAgeUs = ageUs(now, q.LastCompletionTime);
+            q.MaxLatencyAgeUs = ageUs(now, q.MaxLatencyTime);
+            // Oldest request: the largest age. Last completion: the smallest age (most recent).
+            if (q.OldestInFlightAgeUs !== null &&
+                (total.OldestInFlightAgeUs === null || q.OldestInFlightAgeUs > total.OldestInFlightAgeUs)) {
+                total.OldestInFlightAgeUs = q.OldestInFlightAgeUs;
+            }
+            if (q.LastCompletionAgeUs !== null &&
+                (total.LastCompletionAgeUs === null || q.LastCompletionAgeUs < total.LastCompletionAgeUs)) {
+                total.LastCompletionAgeUs = q.LastCompletionAgeUs;
+            }
+            // The max latency time belongs to the queue holding the overall max.
+            if (q.MaxUs > total.MaxUs) {
+                total.MaxLatencyAgeUs = q.MaxLatencyAgeUs;
+            }
+        }
         if (q.MinUs && (!total.MinUs || q.MinUs < total.MinUs)) {
             total.MinUs = q.MinUs;
         }
@@ -190,6 +267,10 @@ function summarize(source, header, queues, typed) {
 
     const result = { Source: source, Version: header.Version, QueueCount: queues.length };
     RESET_FIELDS.forEach(f => result[f] = header[f]);
+    if (header.HasV4) {
+        result.LastResetAgeUs = ageUs(now, header.LastResetTime);
+        result.AgesRelativeTo = nowSource;
+    }
     result.Queues = queues;
     result.Total = total;
     result.Status = status;
@@ -209,8 +290,8 @@ function checkMagicAndVersion(source, magic, version) {
 
 // ---- Typed path: vioscsi symbols available ----
 
-function readTypedQueue(q, index, latencyBuckets, statusSlots) {
-    return addLatencyStats({
+function readTypedQueue(q, index, latencyBuckets, statusSlots, hasV4) {
+    const row = addLatencyStats({
         Queue: index,
         Reads: num(q.ReadCount),
         Writes: num(q.WriteCount),
@@ -228,6 +309,16 @@ function readTypedQueue(q, index, latencyBuckets, statusSlots) {
         LatencyBuckets: readArray(q.Latency.Buckets, latencyBuckets),
         StatusHistogram: readArray(q.StatusHistogram, statusSlots)
     });
+    if (hasV4) {
+        row.InFlight = num(q.InFlightCount);
+        row.OldestInFlightTime = num(q.OldestInFlightTime);
+        row.LastCompletionTime = num(q.LastCompletionTime);
+        row.MaxLatencyTime = num(q.MaxLatencyTime);
+        row.Slow1s = num(q.Slow1sCount);
+        row.Slow5s = num(q.Slow5sCount);
+        row.Slow30s = num(q.Slow30sCount);
+    }
+    return row;
 }
 
 function readTypedAdapter(adapterPtr) {
@@ -246,10 +337,16 @@ function readTypedAdapter(adapterPtr) {
         StatusSlots: Math.min(num(t.StatusSlots), STOR_TELEMETRY_STATUS_SLOTS)
     };
     RESET_FIELDS.forEach(f => header[f] = num(t[f]));
+    // A PDB from before version 4 has no SnapshotTime; read what it has as version 3.
+    header.HasV4 = version >= 4 && t.SnapshotTime !== undefined;
+    if (header.HasV4) {
+        header.LastResetTime = num(t.LastResetTime);
+        header.SnapshotTime = num(t.SnapshotTime);
+    }
     const queueCount = Math.min(num(t.QueueCount), MAX_CPU);
     const queues = [];
     for (let i = 0; i < queueCount; i++) {
-        queues.push(readTypedQueue(t.Queues[i], i, header.LatencyBuckets, header.StatusSlots));
+        queues.push(readTypedQueue(t.Queues[i], i, header.LatencyBuckets, header.StatusSlots, header.HasV4));
     }
     return summarize(source, header, queues, t);
 }
@@ -304,12 +401,15 @@ function readRawHeader(address, source, strict) {
     if (statusSlots < 1 || statusSlots > RAW_MAX_ARRAY_SLOTS) {
         throw implausible("StatusSlots " + statusSlots + " not in 1.." + RAW_MAX_ARRAY_SLOTS);
     }
-    if (headerSize < HEADER_V3_SIZE || headerSize > RAW_MAX_HEADER_SIZE || headerSize % 8 !== 0) {
-        throw implausible("HeaderSize " + headerSize + " is not a multiple of 8 in " + HEADER_V3_SIZE + ".." +
+    const hasV4 = version >= 4;
+    const minHeaderSize = hasV4 ? HEADER_V4_SIZE : HEADER_V3_SIZE;
+    if (headerSize < minHeaderSize || headerSize > RAW_MAX_HEADER_SIZE || headerSize % 8 !== 0) {
+        throw implausible("HeaderSize " + headerSize + " is not a multiple of 8 in " + minHeaderSize + ".." +
                           RAW_MAX_HEADER_SIZE);
     }
     // Only the fields this script knows are read from each queue; QueueSize may be larger.
-    const queueSlots = QUEUE_COUNTER_SLOTS + latencyBuckets + QUEUE_LATENCY_SLOTS + statusSlots + QUEUE_TRAILER_SLOTS;
+    const queueSlots = QUEUE_COUNTER_SLOTS + latencyBuckets + QUEUE_LATENCY_SLOTS + statusSlots +
+                       QUEUE_TRAILER_SLOTS + (hasV4 ? QUEUE_V4_SLOTS : 0);
     if (queueSize < queueSlots * 8 || queueSize > RAW_MAX_QUEUE_SIZE || queueSize % 8 !== 0) {
         throw implausible("QueueSize " + queueSize + " is not a multiple of 8 in " + queueSlots * 8 + ".." +
                           RAW_MAX_QUEUE_SIZE);
@@ -319,10 +419,14 @@ function readRawHeader(address, source, strict) {
     }
     const header = {
         Version: version, HeaderSize: headerSize, QueueSize: queueSize, QueueCount: queueCount,
-        LatencyBuckets: latencyBuckets, StatusSlots: statusSlots, QueueSlots: queueSlots
+        LatencyBuckets: latencyBuckets, StatusSlots: statusSlots, QueueSlots: queueSlots, HasV4: hasV4
     };
-    const resets = readValues(address.add(HEADER_ULONGS * 4), RESET_FIELDS.length, 8);
+    const resets = readValues(address.add(HEADER_ULONGS * 4), RESET_FIELDS.length + (hasV4 ? 2 : 0), 8);
     RESET_FIELDS.forEach((f, i) => header[f] = num(resets[i]));
+    if (hasV4) {
+        header.LastResetTime = num(resets[RESET_FIELDS.length]);
+        header.SnapshotTime = num(resets[RESET_FIELDS.length + 1]);
+    }
     return header;
 }
 
@@ -333,7 +437,7 @@ function readRawQueue(address, index, header) {
     const status = latency + QUEUE_LATENCY_SLOTS;
     const trailer = status + header.StatusSlots;
     const slice = (from, count) => v.slice(from, from + count).map(num);
-    return addLatencyStats({
+    const row = addLatencyStats({
         Queue: index,
         Reads: num(v[0]),
         Writes: num(v[1]),
@@ -351,6 +455,17 @@ function readRawQueue(address, index, header) {
         LatencyBuckets: slice(buckets, header.LatencyBuckets),
         StatusHistogram: slice(status, header.StatusSlots)
     });
+    if (header.HasV4) {
+        const v4 = trailer + QUEUE_TRAILER_SLOTS;
+        row.OldestInFlightTime = num(v[v4]);
+        row.LastCompletionTime = num(v[v4 + 1]);
+        row.MaxLatencyTime = num(v[v4 + 2]);
+        row.Slow1s = num(v[v4 + 3]);
+        row.Slow5s = num(v[v4 + 4]);
+        row.Slow30s = num(v[v4 + 5]);
+        row.InFlight = low32(v[v4 + 6]); // ULONG InFlightCount, then ULONG Reserved2
+    }
+    return row;
 }
 
 function readRawTelemetry(address, source, strict) {
@@ -658,6 +773,21 @@ const SUMMARY_COLUMNS = [
     { name: "QFull", value: r => r.QueueFull }
 ];
 
+function fmtAgo(us) {
+    return (us === null || us === undefined) ? "-" : fmtUs(us) + " ago";
+}
+
+const STALL_COLUMNS = [
+    { name: "Queue", value: r => r.Queue },
+    { name: "InFlight", value: r => r.InFlight },
+    { name: "OldestInFlight", value: r => fmtUs(r.OldestInFlightAgeUs) },
+    { name: "LastCompletion", value: r => fmtAgo(r.LastCompletionAgeUs) },
+    { name: "MaxLatencyAt", value: r => fmtAgo(r.MaxLatencyAgeUs) },
+    { name: ">1s", value: r => r.Slow1s },
+    { name: ">5s", value: r => r.Slow5s },
+    { name: ">30s", value: r => r.Slow30s }
+];
+
 function printAdapters(adapters, all, emptyMessage) {
     const showAll = all !== undefined && !isZero(all);
     if (adapters.length === 0) {
@@ -670,11 +800,26 @@ function printAdapters(adapters, all, emptyMessage) {
         log("Resets: bus " + a.BusResetCount + ", device " + a.DeviceResetCount + ", LUN " +
             a.LogicalUnitResetCount + "; last " + fmtUs(a.LastResetDurationUs) + ", max " +
             fmtUs(a.MaxResetDurationUs) + "; DeviceReset with TMF in flight " + a.DeviceResetTmfInFlightCount);
+        const hasV4 = a.AgesRelativeTo !== undefined;
+        if (hasV4) {
+            log("Last reset: " + (a.LastResetAgeUs === null ? "never" : fmtAgo(a.LastResetAgeUs)));
+        }
         log("");
-        const rows = a.Queues.filter(q => showAll || q.Completions || q.QueueFull);
+        const rows = a.Queues.filter(q => showAll || q.Completions || q.QueueFull || q.InFlight);
         rows.push(a.Total);
         fmtTable(SUMMARY_COLUMNS, rows);
         log("");
+        if (hasV4) {
+            log("Stall indicators (ages relative to " + (a.AgesRelativeTo || "an unknown time") + "):");
+            fmtTable(STALL_COLUMNS, rows);
+            for (const q of a.Queues) {
+                if (q.InFlight && q.OldestInFlightAgeUs !== null && q.OldestInFlightAgeUs >= STALL_WARN_US) {
+                    log("WARNING: queue " + q.Queue + " has " + q.InFlight + " request(s) in flight, the oldest for " +
+                        fmtUs(q.OldestInFlightAgeUs));
+                }
+            }
+            log("");
+        }
         const status = Object.keys(a.Status).map(k => k + "=" + a.Status[k]).join(", ");
         log("SRB status: " + (status || "(none)"));
     }

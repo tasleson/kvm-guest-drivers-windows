@@ -293,6 +293,12 @@ The telemetry lives in the adapter's device extension in nonpaged pool, so it is
 present in **kernel, automatic or complete memory dumps**. Small memory dumps (minidumps)
 don't contain it.
 
+The version 4 stall indicators are included. Their ages are measured against the interrupt
+time at the moment of the dump (read from `KUSER_SHARED_DATA`), so "oldest in flight 60s"
+means a request had been outstanding that long when the system crashed. If that page isn't in
+the dump, the script falls back to the time of the driver's last IOCTL snapshot and says that
+the ages may be understated.
+
 Symbols are optional:
 
 - **With matching vioscsi symbols** (a private PDB from the same build as the `vioscsi.sys` in
