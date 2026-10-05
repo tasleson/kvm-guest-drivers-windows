@@ -7,6 +7,7 @@ This directory contains diagnostic tools for Windows guest systems running virti
 - **CollectSystemInfo.ps1** - Comprehensive diagnostics bundle (1-5 minutes)
 - **GetVirtioWinInfo.ps1** - Quick version check and reboot status (~5 seconds)
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics from WinPE/WinRE
+- **GetVioScsiTelemetry.ps1** - vioscsi per-queue I/O, latency and error counters from a running system
 
 ---
 
@@ -236,6 +237,37 @@ Common causes:
 
 - **CollectSystemInfo.ps1** - Full system diagnostics including virtio-win information plus comprehensive system data
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics when Windows won't boot
+
+---
+
+# GetVioScsiTelemetry
+
+## Overview
+
+The vioscsi driver keeps cumulative per-queue telemetry: read/write/flush/unmap counts
+and bytes, a log2 latency histogram with min/max/average, a histogram of SRB completion
+statuses, the in-flight high-water mark, the number of times a virtqueue was full, and
+adapter-wide reset counts and durations. This script reads it from every vioscsi adapter
+with an `IOCTL_SCSI_MINIPORT` request and prints a summary. It needs a vioscsi driver
+with telemetry version 3 or later, and must be run as Administrator.
+
+Counters accumulate from when the adapter was started and cannot be cleared, so compare
+two snapshots to see what changed over an interval. Latency percentiles are upper bounds of
+the histogram bucket they fall in (buckets double in width).
+
+## Usage
+
+```powershell
+.\GetVioScsiTelemetry.ps1                  # summary of every vioscsi adapter
+.\GetVioScsiTelemetry.ps1 -All             # include queues with no completed requests
+.\GetVioScsiTelemetry.ps1 -Port 2          # only \\.\Scsi2:
+.\GetVioScsiTelemetry.ps1 -PassThru        # objects (incl. raw histograms) for further processing
+.\GetVioScsiTelemetry.ps1 -SaveRaw C:\temp # also save each raw snapshot as a .bin file
+.\GetVioScsiTelemetry.ps1 -InputFile C:\temp\vioscsi-telemetry-scsi2-20261005-101500.bin
+```
+
+`-InputFile` parses a saved snapshot without talking to the driver, so a `.bin`
+collected from a guest can be examined elsewhere (Windows PowerShell 5.1 or PowerShell 7).
 
 ---
 
