@@ -278,13 +278,25 @@ collected from a guest can be examined elsewhere (Windows PowerShell 5.1 or Powe
 
 WinDbg JavaScript extension that prints the vioscsi telemetry described under
 [GetVioScsiTelemetry](#getvioscsitelemetry) from a crash dump or a live kernel debugging
-session, in the same format as the PowerShell script. vioscsi lists its started adapters in
-the global `vioscsi!VioScsiTelemetryDirectory`, and the script reads each adapter's
-`Telemetry` block through the driver's PDB.
+session, in the same format as the PowerShell script. vioscsi lists its started adapters
+(up to 16) in the global `vioscsi!VioScsiTelemetryDirectory`.
 
 The telemetry lives in the adapter's device extension in nonpaged pool, so it is only
 present in **kernel, automatic or complete memory dumps**. Small memory dumps (minidumps)
-don't contain it. Matching vioscsi symbols are required.
+don't contain it.
+
+Symbols are optional:
+
+- **With matching vioscsi symbols** (a private PDB from the same build as the `vioscsi.sys` in
+  the dump), the script reads the directory by name and each adapter's `Telemetry` through the
+  PDB types, and `dx` results include the typed `Telemetry` object for drill-down.
+- **Without symbols**, it finds `vioscsi.sys` in the loaded module list (always present in a
+  kernel dump), scans the image's writable sections for the directory's magic (`VSTD`), and
+  parses each `STOR_TELEMETRY` from the raw layout its own header describes. The summary is the
+  same; only the typed `Telemetry` object is missing. This needs a driver build that has the
+  directory.
+- `!vioscsi_telemetry_at` and `!vioscsi_telemetry_scan` never use symbols or the directory, so
+  they also work on a STOR_TELEMETRY found some other way, e.g. with `s -d <range> 53505331`.
 
 ## Usage
 
@@ -293,11 +305,18 @@ don't contain it. Matching vioscsi symbols are required.
 !vioscsi_telemetry                       # every registered vioscsi adapter
 !vioscsi_telemetry <adapter extension>   # one adapter, by its miniport device extension address
 !vioscsi_telemetry 0 1                   # all adapters, including queues with no completions
+!vioscsi_telemetry_at <address> [1]      # parse the STOR_TELEMETRY at a known address
+!vioscsi_telemetry_scan <start> <len> [1]  # scan a range for STOR_TELEMETRY blocks
 dx @$vioscsiTelemetry()                  # the same data as debugger data model objects
 dx -r3 @$vioscsiTelemetry()[0].Queues    # per-queue values including raw histograms
 ```
 
-The raw structure is also available directly, e.g.
+`dx @$vioscsiTelemetryAt(<address>)` and `dx @$vioscsiTelemetryScan(<start>, <len>)` return
+the corresponding objects. A scan uses the debugger's native `s -d` search and falls back to
+reading the range page by page (skipping pages missing from the dump) if that isn't available.
+Either way it is slow over very large ranges, so keep it to a region you have reason to suspect.
+
+With symbols, the raw structure is also available directly, e.g.
 `dx -r2 ((vioscsi!_ADAPTER_EXTENSION *)<address>)->Telemetry`.
 
 ---
