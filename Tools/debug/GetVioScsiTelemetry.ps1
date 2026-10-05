@@ -400,6 +400,7 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
         LastResetDurationUs         = & $u64 56
         MaxResetDurationUs          = & $u64 64
         DeviceResetTmfInFlightCount = & $u64 72
+        LastResetTime               = $(if ($hasV4) { & $u64 80 } else { [uint64]0 })
         LastResetAgeUs              = $(if ($hasV4) { Get-AgeUs $snapshotTime (& $u64 80) } else { $null })
         Queues                      = $queues
         Total                       = [PSCustomObject]$total
@@ -422,7 +423,9 @@ function Write-TelemetrySummary($T) {
                 $T.BusResetCount, $T.DeviceResetCount, $T.LogicalUnitResetCount,
                 (Format-Us $T.LastResetDurationUs), (Format-Us $T.MaxResetDurationUs), $T.DeviceResetTmfInFlightCount)
     if ($T.Version -ge 4) {
-        $lastReset = $(if ($null -ne $T.LastResetAgeUs) { "$(Format-Us $T.LastResetAgeUs) ago" } else { 'never' })
+        # No age means either no reset yet (time 0) or no time reference to measure it against.
+        $lastReset = $(if ($null -ne $T.LastResetAgeUs) { "$(Format-Us $T.LastResetAgeUs) ago" }
+                       elseif ($T.LastResetTime) { 'unknown' } else { 'never' })
         Write-Host ("Last reset: {0}" -f $lastReset)
     }
     $rows | Format-Table -AutoSize -Property Queue, Reads, Writes, Flushes, Unmaps, Other,

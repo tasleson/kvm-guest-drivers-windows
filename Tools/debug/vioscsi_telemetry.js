@@ -268,6 +268,7 @@ function summarize(source, header, queues, typed) {
     const result = { Source: source, Version: header.Version, QueueCount: queues.length };
     RESET_FIELDS.forEach(f => result[f] = header[f]);
     if (header.HasV4) {
+        result.LastResetTime = header.LastResetTime;
         result.LastResetAgeUs = ageUs(now, header.LastResetTime);
         result.AgesRelativeTo = nowSource;
     }
@@ -337,11 +338,22 @@ function readTypedAdapter(adapterPtr) {
         StatusSlots: Math.min(num(t.StatusSlots), STOR_TELEMETRY_STATUS_SLOTS)
     };
     RESET_FIELDS.forEach(f => header[f] = num(t[f]));
-    // A PDB from before version 4 has no SnapshotTime; read what it has as version 3.
-    header.HasV4 = version >= 4 && t.SnapshotTime !== undefined;
-    if (header.HasV4) {
-        header.LastResetTime = num(t.LastResetTime);
-        header.SnapshotTime = num(t.SnapshotTime);
+    // A PDB from before version 4 lacks the v4 members, and the JS provider may throw rather
+    // than return undefined for a missing one. Trust the header's own HeaderSize first, then
+    // probe the members, so a v4 blob with an old PDB degrades to the v3 view instead of erroring.
+    header.HasV4 = false;
+    if (version >= 4 && num(t.HeaderSize) >= HEADER_V4_SIZE) {
+        try {
+            const lastReset = num(t.LastResetTime);
+            const snapshot = num(t.SnapshotTime);
+            if (t.Queues[0].Slow30sCount !== undefined) {
+                header.HasV4 = true;
+                header.LastResetTime = lastReset;
+                header.SnapshotTime = snapshot;
+            }
+        } catch (e) {
+            // PDB predates version 4; fall back to the v3 fields.
+        }
     }
     const queueCount = Math.min(num(t.QueueCount), MAX_CPU);
     const queues = [];
@@ -802,7 +814,8 @@ function printAdapters(adapters, all, emptyMessage) {
             fmtUs(a.MaxResetDurationUs) + "; DeviceReset with TMF in flight " + a.DeviceResetTmfInFlightCount);
         const hasV4 = a.AgesRelativeTo !== undefined;
         if (hasV4) {
-            log("Last reset: " + (a.LastResetAgeUs === null ? "never" : fmtAgo(a.LastResetAgeUs)));
+            log("Last reset: " + (a.LastResetAgeUs !== null ? fmtAgo(a.LastResetAgeUs) :
+                                  (a.LastResetTime ? "unknown" : "never")));
         }
         log("");
         const rows = a.Queues.filter(q => showAll || q.Completions || q.QueueFull || q.InFlight);
