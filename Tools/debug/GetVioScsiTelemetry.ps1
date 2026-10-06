@@ -500,9 +500,17 @@ function Format-Ago($Us) {
 }
 
 function Test-TargetActive($Target) {
-    # Mirrors StorPerfTargetActive() in the driver, which is what decides if a target is reported.
-    return [bool]($Target.InFlight -or $Target.Reads -or $Target.Writes -or $Target.Other -or $Target.NoDevice -or
-                  $Target.DeviceResets -or $Target.LunResets)
+    # Deliberately narrower than StorPerfTargetActive() in the driver (which is what decides
+    # whether a target is in the snapshot at all -- see vioscsi.c). That check also counts
+    # Other/NoDevice/InvalidTarget/DeviceResets/LunResets, which a routine Windows bus rescan
+    # trips for every unattached target ID it probes -- including InvalidTarget: the device
+    # answers VIRTIO_SCSI_S_BAD_TARGET (-> SRB_STATUS_INVALID_TARGET_ID) for any in-range ID
+    # with nothing behind it, so practically every unattached target racks one up during
+    # enumeration. None of that means a real device, so a target only gets its own row here if
+    # it did real I/O or is currently stuck in flight (so a stall with zero completions is still
+    # visible). InvalidTarget still shows as a column for any row included for one of those
+    # reasons; it just isn't a reason to include a row by itself.
+    return [bool]($Target.Reads -or $Target.Writes -or $Target.InFlight)
 }
 
 function Write-TelemetrySummary($T) {
