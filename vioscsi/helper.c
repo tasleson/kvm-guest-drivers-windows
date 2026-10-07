@@ -244,7 +244,7 @@ SendTMF(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 }
 
 BOOLEAN
-DeviceReset(IN PVOID DeviceExtension)
+DeviceReset(IN PVOID DeviceExtension, IN UCHAR TargetId, IN UCHAR Lun)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
     PSCSI_REQUEST_BLOCK Srb = &adaptExt->tmf_cmd.Srb;
@@ -265,22 +265,30 @@ DeviceReset(IN PVOID DeviceExtension)
     // BuildIo on other CPUs) while the first TMF is still outstanding. That is normal
     // interrupt/DPC latency, not a fault. Claim the buffer atomically, and before posting
     // it, so the ISR can't see a completion for a TMF it doesn't know is in flight. If one
-    // is already outstanding, fold this request into it: every reset level sends the same
-    // TMF, so a second one would add nothing, and rebuilding tmf_cmd now would corrupt the
-    // buffer the device still owns.
+    // is already outstanding, fold this request into it: rebuilding tmf_cmd now would
+    // corrupt the buffer the device still owns. A reset for the same target and LUN loses
+    // nothing by that. One for a different target does -- it is reported as done without
+    // that target being reset, which is no worse than when every TMF went to target 0, but
+    // sending it would need a queue of pending targets drained as each TMF is reaped.
     if (InterlockedCompareExchange(&adaptExt->tmf_infly, TRUE, FALSE) != FALSE)
     {
         InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.DeviceResetTmfInFlightCount);
-        RhelDbgPrint(TRACE_LEVEL_WARNING, " TMF already in flight, coalescing this reset into it.\n");
+        RhelDbgPrint(TRACE_LEVEL_WARNING,
+                     " TMF already in flight, coalescing reset of target %d LUN %d into it.\n",
+                     TargetId,
+                     Lun);
         return TRUE;
     }
     Srb->SrbExtension = srbExt;
     RtlZeroMemory((PVOID)cmd, sizeof(VirtIOSCSICmd));
     cmd->srb = (PVOID)Srb;
+    // Same addressing as BuildIo puts on a command: byte 1 is the target, byte 3 the LUN.
+    // These used to be hard-coded to 0, so every reset went to target 0 whichever target
+    // had actually stopped responding.
     cmd->req.tmf.lun[0] = 1;
-    cmd->req.tmf.lun[1] = 0;
+    cmd->req.tmf.lun[1] = TargetId;
     cmd->req.tmf.lun[2] = 0;
-    cmd->req.tmf.lun[3] = 0;
+    cmd->req.tmf.lun[3] = Lun;
     cmd->req.tmf.type = VIRTIO_SCSI_T_TMF;
     cmd->req.tmf.subtype = VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET;
 
