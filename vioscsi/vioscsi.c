@@ -1492,50 +1492,82 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
     return Status;
 }
 
-// Storport handed VioScsiBuildIo an SRB extension for a new request. If a request completed early
-// (reset, unit removal) lived in it and the device hasn't returned that request, the device still
-// references this memory: zeroing it for the new request also zeroes the descriptor table the
-// device may yet read, and the device may yet write the old response over the new request.
+// Storport handed VioScsiBuildIo an SRB extension for a new request. If a request the device hasn't
+// returned lived in it, the device still references this memory: zeroing it for the new request
+// also zeroes the descriptor table the device may yet read, and the device may yet write the old
+// response over the new request.
+//
+// The extension's own ownership mark is checked first: it is one read, it describes the request
+// exactly (cookie, queue, avail position, table, publication time) and it survives the request's
+// zombie entry being evicted from a full table. The mark alone isn't proof, though. ProcessQueue
+// can't clear it when an early-completed request comes back as an orphan (the extension may have
+// been freed by then), so a marked extension with no zombie entry and no evictions so far is one
+// the device has already returned. Zombies[] is then consulted, through a filter that makes the
+// common case a single read, to confirm and to catch an extension whose mark is gone (zeroed by an
+// earlier reuse) while an older request in it is still outstanding.
 static VOID CheckExtensionStillReferenced(IN PADAPTER_EXTENSION adaptExt,
                                           IN PSRB_EXTENSION srbExt,
                                           IN PSCSI_REQUEST_BLOCK Srb,
                                           IN UCHAR TargetId,
                                           IN UCHAR Lun)
 {
+    BOOLEAN marked = (srbExt->OwnedMagic == VIOSCSI_SRBEXT_OWNED_MAGIC);
     PVIOSCSI_ZOMBIE zombie = VioScsiZombieFindExt(adaptExt, srbExt);
     ULONG64 flags = 0;
+    ULONG queue;
+    USHORT availPos;
+    ULONG_PTR id;
+    ULONG64 tablePa;
+    ULONG64 since;
 
-    if (zombie == NULL)
+    if (zombie == NULL && (!marked || adaptExt->Telemetry.ZombieEvictedCount == 0))
     {
         return;
     }
-    if (srbExt->OwnedMagic == VIOSCSI_SRBEXT_OWNED_MAGIC)
+    if (marked)
     {
         flags |= VIOSCSI_REUSE_STILL_MARKED;
+        queue = srbExt->QueueIndex;
+        availPos = srbExt->AvailPos;
+        id = srbExt->id;
+        tablePa = srbExt->TablePa;
+        since = srbExt->OwnedTime;
     }
-    if (InterlockedExchange(&zombie->Reused, TRUE) != 0)
+    else
     {
-        flags |= VIOSCSI_REUSE_AGAIN;
+        queue = zombie->Queue;
+        availPos = zombie->AvailPos;
+        id = (ULONG_PTR)zombie->Id;
+        tablePa = zombie->TablePa;
+        since = zombie->Time;
+    }
+    if (zombie != NULL)
+    {
+        flags |= VIOSCSI_REUSE_IN_ZOMBIES;
+        if (InterlockedExchange(&zombie->Reused, TRUE) != 0)
+        {
+            flags |= VIOSCSI_REUSE_AGAIN;
+        }
     }
     InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.ExtReusedWhileOwnedCount);
     VioScsiRecordEventEx(adaptExt,
                          VioScsiEventExtReused,
-                         zombie->Queue,
-                         zombie->AvailPos,
+                         queue,
+                         availPos,
                          TargetId,
                          Lun,
-                         (ULONG_PTR)zombie->Id,
+                         id,
                          srbExt,
                          Srb,
-                         zombie->TablePa,
-                         StorPerfInterruptTime(adaptExt) - zombie->Time,
+                         tablePa,
+                         StorPerfInterruptTime(adaptExt) - since,
                          flags);
     RhelDbgPrint(TRACE_LEVEL_ERROR,
-                 " SRB 0x%p reuses extension 0x%p while the device still holds request id 0x%p, table 0x%I64x\n",
+                 " SRB 0x%p reuses extension 0x%p while the device may still hold request id 0x%p, table 0x%I64x\n",
                  Srb,
                  srbExt,
-                 (void *)(ULONG_PTR)zombie->Id,
-                 zombie->TablePa);
+                 (void *)id,
+                 tablePa);
 }
 
 // FALSE for the SRB functions PreProcessRequest completes itself: their data buffers (WMI and

@@ -699,10 +699,11 @@ typedef enum _VIOSCSI_EVENT_CODE
     VioScsiEventPause = 10,
     // StorPortResume. Value2: VIOSCSI_SITE_*.
     VioScsiEventResume = 11,
-    // VioScsiBuildIo was handed an SRB extension that a request completed early still lives in, so
-    // the device can still read its old descriptors (which BuildIo is about to zero) and write its
-    // old response. Queue, Id and TablePa: that earlier request; Srb, Target and Lun: the new one.
-    // Value1: 100 ns since the earlier request was completed early, Value2: VIOSCSI_REUSE_*.
+    // VioScsiBuildIo was handed an SRB extension that a request the device hasn't returned still
+    // lives in, so the device can still read its old descriptors (which BuildIo is about to zero)
+    // and write its old response. Queue, AvailPos, Id and TablePa: that earlier request; Srb,
+    // Target and Lun: the new one. Value2: VIOSCSI_REUSE_*. Value1: 100 ns since the earlier
+    // request was published if VIOSCSI_REUSE_STILL_MARKED, else since it was completed early.
     VioScsiEventExtReused = 12,
     // VioScsiBuildIo refused a request with a zero-length scatter/gather element. Id: SRB function,
     // Value1: element index << 32 | NumberOfElements, Value2: SRB flags << 32 | DataTransferLength.
@@ -723,8 +724,11 @@ typedef enum _VIOSCSI_EVENT_CODE
 #define VIOSCSI_ORPHAN_EXT_REUSED           0x2 // ...whose extension already serves another request
 
 // VioScsiEventExtReused Value2.
-#define VIOSCSI_REUSE_STILL_MARKED          0x1 // the extension still had OwnedMagic set
+#define VIOSCSI_REUSE_STILL_MARKED          0x1 // OwnedMagic was set: the fields are the extension's own
 #define VIOSCSI_REUSE_AGAIN                 0x2 // already reused once while that request was out
+#define VIOSCSI_REUSE_IN_ZOMBIES                                                                                       \
+    0x4 // Zombies[] has the request: the device hasn't returned it
+        // (without it, the entry was evicted from a full table)
 
 // VioScsiEventEarlyComplete Value1: why the request was completed early.
 #define VIOSCSI_EARLY_RESET                 1 // CompletePendingRequestsOnReset
@@ -781,6 +785,9 @@ typedef struct _VIOSCSI_EVENT_RING
 //
 #define VIOSCSI_ZOMBIE_SLOTS  1024 // a power of two
 #define VIOSCSI_ZOMBIE_PROBES 64
+// Live zombies per hash of their SrbExt, so VioScsiBuildIo can rule out an extension with one read
+// instead of scanning Zombies[] while early-completed requests are outstanding.
+#define VIOSCSI_ZOMBIE_FILTER_SLOTS 1024 // a power of two
 
 typedef struct _VIOSCSI_ZOMBIE
 {
@@ -797,6 +804,7 @@ typedef struct _VIOSCSI_ZOMBIE
 } VIOSCSI_ZOMBIE, *PVIOSCSI_ZOMBIE;
 
 C_ASSERT((VIOSCSI_ZOMBIE_SLOTS & (VIOSCSI_ZOMBIE_SLOTS - 1)) == 0);
+C_ASSERT((VIOSCSI_ZOMBIE_FILTER_SLOTS & (VIOSCSI_ZOMBIE_FILTER_SLOTS - 1)) == 0);
 C_ASSERT(sizeof(VIOSCSI_ZOMBIE) == 64);
 C_ASSERT(VIOSCSI_ZOMBIE_PROBES >= 1 && VIOSCSI_ZOMBIE_PROBES <= VIOSCSI_ZOMBIE_SLOTS);
 
@@ -885,6 +893,7 @@ typedef struct _ADAPTER_EXTENSION
     VIOSCSI_EVENT_RING EventRing;
     volatile LONG ZombieNext; // slot counter, see VIOSCSI_ZOMBIE
     volatile LONG ZombieLive; // occupied Zombies[] slots
+    volatile LONG ZombieFilter[VIOSCSI_ZOMBIE_FILTER_SLOTS]; // live Zombies[] per VioScsiZombieFilterIndex(SrbExt)
     VIOSCSI_ZOMBIE Zombies[VIOSCSI_ZOMBIE_SLOTS];
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
 

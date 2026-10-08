@@ -1061,10 +1061,18 @@ static LONG64 VioScsiZombieKey(IN ULONG Queue, IN ULONG_PTR Id)
     return (LONG64)(((ULONG64)(Queue & 0xFF) << 56) | ((ULONG64)Id & 0x00FFFFFFFFFFFFFFULL));
 }
 
+// ZombieFilter[] slot for an SRB extension. Extensions are over 16 KB each, so the address bits
+// from 4 KB up tell neighbours apart; the higher bits are folded in for extensions further apart.
+static ULONG VioScsiZombieFilterIndex(IN ULONG64 SrbExt)
+{
+    return (ULONG)((SrbExt >> 12) ^ (SrbExt >> 22)) & (VIOSCSI_ZOMBIE_FILTER_SLOTS - 1);
+}
+
 VOID VioScsiZombieReset(IN PADAPTER_EXTENSION adaptExt)
 {
     // Only from (re)initialization: the device was just reset and holds no requests.
     RtlZeroMemory(adaptExt->Zombies, sizeof(adaptExt->Zombies));
+    RtlZeroMemory((PVOID)adaptExt->ZombieFilter, sizeof(adaptExt->ZombieFilter));
     adaptExt->ZombieLive = 0;
     adaptExt->ZombieNext = 0;
 }
@@ -1097,6 +1105,7 @@ VOID VioScsiZombieAdd(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt)
     evicted = InterlockedExchange64(&zombie->Key, 0);
     if (evicted != 0)
     {
+        InterlockedDecrement(&adaptExt->ZombieFilter[VioScsiZombieFilterIndex(zombie->SrbExt)]);
         InterlockedDecrement(&adaptExt->ZombieLive);
         InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.ZombieEvictedCount);
     }
@@ -1109,6 +1118,7 @@ VOID VioScsiZombieAdd(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt)
     zombie->Queue = SrbExt->QueueIndex;
     zombie->AvailPos = SrbExt->AvailPos;
     zombie->Reserved[0] = zombie->Reserved[1] = zombie->Reserved[2] = 0;
+    InterlockedIncrement(&adaptExt->ZombieFilter[VioScsiZombieFilterIndex(zombie->SrbExt)]);
     InterlockedIncrement(&adaptExt->ZombieLive);
     InterlockedExchange64(&zombie->Key, VioScsiZombieKey(SrbExt->QueueIndex, SrbExt->id));
 }
@@ -1145,6 +1155,7 @@ VioScsiZombieTake(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, IN ULONG_PTR I
         // and the request is no longer known.
         if (InterlockedCompareExchange64(&zombie->Key, 0, key) == key)
         {
+            InterlockedDecrement(&adaptExt->ZombieFilter[VioScsiZombieFilterIndex(Zombie->SrbExt)]);
             InterlockedDecrement(&adaptExt->ZombieLive);
             Zombie->Key = key;
             return TRUE;
@@ -1155,15 +1166,16 @@ VioScsiZombieTake(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, IN ULONG_PTR I
 }
 
 // The entry of a request completed early that lived in SrbExt and that the device hasn't returned
-// yet, or NULL. Called by VioScsiBuildIo for every request, so it costs one read while no request
-// is outstanding that way. The entry's fields may be torn by a concurrent eviction.
+// yet, or NULL. Called by VioScsiBuildIo for every request: ZombieFilter rules out almost every
+// extension with one read, so Zombies[] is only scanned for one that shares a filter slot with a
+// live entry. The entry's fields may be torn by a concurrent eviction.
 PVIOSCSI_ZOMBIE
 VioScsiZombieFindExt(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt)
 {
     ULONG64 ext = (ULONG64)(ULONG_PTR)SrbExt;
     ULONG i;
 
-    if (adaptExt->ZombieLive <= 0)
+    if (adaptExt->ZombieLive <= 0 || adaptExt->ZombieFilter[VioScsiZombieFilterIndex(ext)] <= 0)
     {
         return NULL;
     }
