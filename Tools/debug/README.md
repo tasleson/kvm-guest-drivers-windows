@@ -9,6 +9,7 @@ This directory contains diagnostic tools for Windows guest systems running virti
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics from WinPE/WinRE
 - **GetVioScsiTelemetry.ps1** - vioscsi per-queue and per-target I/O, latency and error counters from a running system
 - **vioscsi_telemetry.js** - WinDbg script showing the same vioscsi counters from a kernel crash dump, plus the per-adapter event ring
+- **evring.py** - The vioscsi event ring and zombie table from a QEMU Windows dump, on the Linux host, without WinDbg
 - **GetVioScsiDriverInfo.ps1** - Which vioscsi driver is installed and loaded (file hash, version, driver store, boot time), to confirm a new build is the one running
 
 ---
@@ -463,6 +464,54 @@ dt vioscsi!_SRB_EXTENSION <SrbExt> OwnedMagic OwnedTime TablePa AvailPos id Queu
 Entries are in slot order there; `Sequence` gives the order (slot `(Sequence - 1) % 32768`).
 An extension whose `OwnedMagic` is `0x444E574F` was put on a virtqueue at `OwnedTime` and the
 device had not returned it.
+
+---
+
+# evring.py
+
+## Overview
+
+Python 3 (3.7 or later, standard library only) script that prints the vioscsi [event ring](#event-ring) and zombie table from the
+Windows crash dump QEMU writes with `dump-guest-memory -w` (for example the `break.dmp` a soak
+run takes when `x-stop-on-broken` freezes the guest at a ring break). It runs on the host that
+has the dump, so going from a QEMU `virtqueue_chain_error` line to the guest's events doesn't
+need the dump copied to a Windows machine. It does what `!vioscsi_events` and `!vioscsi_chain`
+do, with the same columns and wording, but not the telemetry summary.
+
+No symbols are needed. The script finds `VioScsiTelemetryDirectory` by its magic (`VSTD`) in
+physical memory, takes the adapter list and the event ring and zombie offsets from it (version
+2), and reads each adapter's extension through the guest's page tables from the dump header's
+`DirectoryTableBase`. Only the loaded driver's copy of the directory lists adapters, so copies
+of the image elsewhere in memory are ignored. If the directory happens to cross a page boundary
+in a build, finding it takes a walk of the kernel page tables, about a minute. x64 guests and
+full memory dumps (what QEMU writes) only. Ages are against the interrupt time in the dump's
+`KUSER_SHARED_DATA`, or the newest event if that page isn't in the dump.
+
+## Usage
+
+```
+evring.py chain <dump> <table PA> <virtqueue> <pos>   # the request(s) a QEMU chain error names, on any adapter
+evring.py chain <dump> <table PA> <virtqueue> <pos> --resets
+                                         # ...plus the adapter's reset, TMF and pause/resume events
+                                         # from the first event shown on, in sequence
+evring.py chain <dump> 0 <virtqueue> <pos>    # by avail entry only
+evring.py events <dump>                  # last 64 events of every adapter, and its zombies
+evring.py events <dump> --count 1000     # last 1000
+evring.py events <dump> --table <PA>     # every event of the request(s) that owned that table
+evring.py events <dump> --pos <vq> <pos> # every event of the request(s) published at that entry
+evring.py events <dump> --adapter <VA>   # one adapter
+```
+
+Addresses are hex, with or without `0x`. For a QEMU line like
+
+```
+virtqueue_chain_error dev=scsi1 queue=3 pos=37539 head=141 addr=0x2762d25c8 ...
+```
+
+run `evring.py chain break.dmp 0x2762d25c8 3 37539 --resets` and read the result as described
+under [From a QEMU chain error to the guest's events](#from-a-qemu-chain-error-to-the-guests-events).
+`--resets` is what puts an `EarlyComplete` and the `ExtReused` that follows it next to the reset
+that caused them.
 
 ---
 
