@@ -381,9 +381,14 @@ request as it goes onto a virtqueue (`Publish`) and as the device returns it
 device returned that no request list held (`OrphanReturn`), SRB extensions reused while the
 device still referenced them (`ExtReused`), reset SRBs, TMFs sent, coalesced and reaped,
 `StorPortPause`/`Resume`, and refused scatter/gather lists. Every request event carries the
-physical address of the request's indirect descriptor table (`TablePa`): the address QEMU
-reports for the head descriptor of a chain it rejects, e.g. for "virtio: zero sized buffers
-are not allowed". Requests completed early that the device hasn't returned yet are listed
+physical address of the request's indirect descriptor table (`TablePa`), the address QEMU
+reports for the head descriptor of a chain it rejects (e.g. for "virtio: zero sized buffers
+are not allowed"), and the avail ring position it was published at (`AvailPos`, the
+free-running 16-bit avail index, which is what QEMU counts too). The driver records request
+queue indexes; QEMU numbers virtqueues from the control queue, so the driver's request queue
+`N` is QEMU's virtqueue `N + 2` (0 is control, 1 is events). The script shows each request's
+entry in QEMU's terms, as `VQ:Pos`. A packed ring has no avail index, so no positions are
+recorded and only the table address can be matched. Requests completed early that the device hasn't returned yet are listed
 in `Zombies` until it does. Neither is recorded by the crash dump instance of the driver.
 
 The ring is sized for investigating virtqueue breaks after resets, not for production: about
@@ -392,21 +397,46 @@ The ring is sized for investigating virtqueue breaks after resets, not for produ
 busy adapter.
 
 ```
+!vioscsi_chain <table PA> <virtqueue> <pos>  # the request(s) a QEMU chain error names, on any adapter
 !vioscsi_events                          # last 64 events of every adapter, and its zombies
 !vioscsi_events 0 0 1000                 # last 1000
 !vioscsi_events 0 <table PA>             # every event of the request(s) that owned that table
+!vioscsi_events 0 0 0 <virtqueue> <pos>  # every event of the request(s) published at that entry
 !vioscsi_events <adapter extension>      # one adapter
 dx @$vioscsiEvents()                     # decoded events and zombies as objects
 ```
 
-Ages are measured against the dump's interrupt time. To find out what happened to the
-request QEMU choked on, take the table address from QEMU's report and run
-`!vioscsi_events 0 <table PA>`. The events are matched by `TablePa` and by SRB extension,
-since the table lives in the extension. Read the result like this:
+Ages are measured against the dump's interrupt time.
 
-- `ExtReused` for that table before the break: the device still referenced the extension
-  when `VioScsiBuildIo` zeroed it for another request. The `Publish`, `EarlyComplete` and
-  `ExtReused` sequence shows the request being handed back early and its memory reused.
+### From a QEMU chain error to the guest's events
+
+QEMU logs a rejected descriptor chain as a trace line like
+
+```
+virtqueue_chain_error dev=scsi2 queue=3 pos=41213 head=17 addr=0x7f3a1000 ...
+```
+
+Load the script in the dump taken at the break and pass it `addr`, `queue` and `pos`:
+
+```
+.scriptload C:\path\to\vioscsi_telemetry.js
+!vioscsi_chain 0x7f3a1000 3 41213
+```
+
+`dev` is QEMU's id for the adapter, which the guest doesn't know, so every adapter is searched
+and only those with a match are printed. An event matches if its `TablePa` is `addr`, or if it
+names avail entry `pos` of virtqueue `queue` (`VQ:Pos` in the table). Every other event of the
+same SRB extensions is added, since the table lives in the extension: that is where a reuse of
+the memory shows up. Outstanding zombies for the entry are listed after the events. If nothing
+matches, the request is older than the ring (32768 events back) or the address isn't one of
+this guest's tables. Read the result like this:
+
+- `ExtReused` for that entry before the break: `VioScsiBuildIo` zeroed the extension for
+  another request while the device had not returned this one. The `Publish`, `EarlyComplete`
+  and `ExtReused` sequence shows the request being handed back early and its memory reused.
+  `DEVICE STILL HOLDS` means the zombie table confirms the device hadn't returned it; `MAY
+  STILL BE HELD` means the extension was still marked but its zombie entry is gone, which
+  happens only after evictions (`ZombieEvictedCount`).
 - A `Publish` and nothing after it, with no zero length found by `ZeroLengthDesc`: the
   driver published a valid table and did not touch it again, so the zero came from
   elsewhere.
@@ -425,8 +455,9 @@ read directly:
 ```
 dx vioscsi!VioScsiTelemetryDirectory.Adapters
 dx -g ((vioscsi!_ADAPTER_EXTENSION *)<adapter>)->EventRing.Entries.Where(e => e.TablePa == <table PA>)
+dx -g ((vioscsi!_ADAPTER_EXTENSION *)<adapter>)->EventRing.Entries.Where(e => e.Queue == <virtqueue - 2> && e.AvailPos == <pos>)
 dx -g ((vioscsi!_ADAPTER_EXTENSION *)<adapter>)->Zombies.Where(z => z.Key != 0)
-dt vioscsi!_SRB_EXTENSION <SrbExt> OwnedMagic OwnedTime TablePa id QueueIndex
+dt vioscsi!_SRB_EXTENSION <SrbExt> OwnedMagic OwnedTime TablePa AvailPos id QueueIndex
 ```
 
 Entries are in slot order there; `Sequence` gives the order (slot `(Sequence - 1) % 32768`).
