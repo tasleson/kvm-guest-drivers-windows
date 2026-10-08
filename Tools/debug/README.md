@@ -409,7 +409,9 @@ since the table lives in the extension. Read the result like this:
 - `SgZeroLength`/`SgTooManyElements`: Storport handed the driver a list that would have
   broken the virtqueue; the request was refused instead.
 - `OrphanReturn` flagged `NOT A REQUEST COMPLETED EARLY`: the device returned a cookie the
-  driver never handed back early, so the request lists and the virtqueue disagree.
+  driver never handed back early, so the request lists and the virtqueue disagree. The one
+  exception is a request evicted from a full zombie table, which `ZombieEvictedCount` in the
+  `!vioscsi_telemetry` summary counts; if that is nonzero, an unexplained return may be one.
 
 The script finds the ring through the telemetry directory (version 2 adds the ring and
 zombie table offsets), with or without symbols. With symbols the structures can also be

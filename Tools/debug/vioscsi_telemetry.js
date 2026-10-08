@@ -1297,7 +1297,7 @@ function describeEvent(e) {
             const flags = high32(v1);
             return "used length " + low32(v1) +
                    ((flags & 1) ? ", completed early " + fmtUs(hnsToUs(num(v2))) + " before" :
-                                  ", NOT A REQUEST COMPLETED EARLY") +
+                                  ", NOT A REQUEST COMPLETED EARLY (unless evicted from a full zombie table)") +
                    ((flags & 2) ? ", RETURNED INTO A REUSED EXTENSION" : "");
         }
         case 4:
