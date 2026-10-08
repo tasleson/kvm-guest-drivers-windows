@@ -730,9 +730,9 @@ typedef enum _VIOSCSI_EVENT_CODE
 // VioScsiEventExtReused Value2.
 #define VIOSCSI_REUSE_STILL_MARKED          0x1 // OwnedMagic was set: the fields are the extension's own
 #define VIOSCSI_REUSE_AGAIN                 0x2 // already reused once while that request was out
-#define VIOSCSI_REUSE_IN_ZOMBIES                                                                                       \
-    0x4 // Zombies[] has the request: the device hasn't returned it
-        // (without it, the entry was evicted from a full table)
+// Zombies[] still has the request, so the device hasn't returned it. Without this flag the extension
+// was marked but its entry is gone, which only happens once entries have been evicted.
+#define VIOSCSI_REUSE_IN_ZOMBIES            0x4
 
 // VioScsiEventEarlyComplete Value1: why the request was completed early.
 #define VIOSCSI_EARLY_RESET                 1 // CompletePendingRequestsOnReset
@@ -787,8 +787,8 @@ typedef struct _VIOSCSI_EVENT_RING
 // overwritten (counted in ZombieEvictedCount). Key is cleared before a slot is refilled and
 // written last, so a reader that matched it can claim the slot with a compare-exchange.
 //
-#define VIOSCSI_ZOMBIE_SLOTS  1024 // a power of two
-#define VIOSCSI_ZOMBIE_PROBES 64
+#define VIOSCSI_ZOMBIE_SLOTS        1024 // a power of two
+#define VIOSCSI_ZOMBIE_PROBES       64
 // Live zombies per hash of their SrbExt, so VioScsiBuildIo can rule out an extension with one read
 // instead of scanning Zombies[] while early-completed requests are outstanding.
 #define VIOSCSI_ZOMBIE_FILTER_SLOTS 1024 // a power of two
@@ -898,7 +898,8 @@ typedef struct _ADAPTER_EXTENSION
     VIOSCSI_EVENT_RING EventRing;
     volatile LONG ZombieNext; // slot counter, see VIOSCSI_ZOMBIE
     volatile LONG ZombieLive; // occupied Zombies[] slots
-    volatile LONG ZombieFilter[VIOSCSI_ZOMBIE_FILTER_SLOTS]; // live Zombies[] per VioScsiZombieFilterIndex(SrbExt)
+    // Live Zombies[] entries per VioScsiZombieFilterIndex(SrbExt).
+    volatile LONG ZombieFilter[VIOSCSI_ZOMBIE_FILTER_SLOTS];
     VIOSCSI_ZOMBIE Zombies[VIOSCSI_ZOMBIE_SLOTS];
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
 
