@@ -814,6 +814,8 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
     }
     // Nor does the device hold any request completed early before it was (re)initialized.
     VioScsiZombieReset(adaptExt);
+    // Ring layout is negotiated by now; a packed ring has no avail index to record.
+    adaptExt->EventRing.Flags = adaptExt->vdev.packed_ring ? VIOSCSI_EVENT_RING_PACKED : 0;
 
     if (!adaptExt->dump_mode)
     {
@@ -1516,17 +1518,18 @@ static VOID CheckExtensionStillReferenced(IN PADAPTER_EXTENSION adaptExt,
         flags |= VIOSCSI_REUSE_AGAIN;
     }
     InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.ExtReusedWhileOwnedCount);
-    VioScsiRecordEvent(adaptExt,
-                       VioScsiEventExtReused,
-                       zombie->Queue,
-                       TargetId,
-                       Lun,
-                       (ULONG_PTR)zombie->Id,
-                       srbExt,
-                       Srb,
-                       zombie->TablePa,
-                       StorPerfInterruptTime(adaptExt) - zombie->Time,
-                       flags);
+    VioScsiRecordEventEx(adaptExt,
+                         VioScsiEventExtReused,
+                         zombie->Queue,
+                         zombie->AvailPos,
+                         TargetId,
+                         Lun,
+                         (ULONG_PTR)zombie->Id,
+                         srbExt,
+                         Srb,
+                         zombie->TablePa,
+                         StorPerfInterruptTime(adaptExt) - zombie->Time,
+                         flags);
     RhelDbgPrint(TRACE_LEVEL_ERROR,
                  " SRB 0x%p reuses extension 0x%p while the device still holds request id 0x%p, table 0x%I64x\n",
                  Srb,
@@ -1862,17 +1865,18 @@ static VOID RecordOrphanReturn(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, I
                      (void *)Id,
                      Queue);
     }
-    VioScsiRecordEvent(adaptExt,
-                       VioScsiEventOrphanReturn,
-                       Queue,
-                       0,
-                       0,
-                       Id,
-                       (PVOID)(ULONG_PTR)zombie.SrbExt,
-                       (PVOID)(ULONG_PTR)zombie.Srb,
-                       zombie.TablePa,
-                       Len | (flags << 32),
-                       age);
+    VioScsiRecordEventEx(adaptExt,
+                         VioScsiEventOrphanReturn,
+                         Queue,
+                         zombie.AvailPos,
+                         0,
+                         0,
+                         Id,
+                         (PVOID)(ULONG_PTR)zombie.SrbExt,
+                         (PVOID)(ULONG_PTR)zombie.Srb,
+                         zombie.TablePa,
+                         Len | (flags << 32),
+                         age);
 }
 
 VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr)

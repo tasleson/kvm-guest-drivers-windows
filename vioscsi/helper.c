@@ -76,6 +76,21 @@ static VOID CheckPublishedTable(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSIO
     }
 }
 
+// The avail ring index a request was just published at, for matching it with what QEMU reports
+// about a descriptor chain. Read from the ring itself: struct virtqueue exposes the avail ring
+// (avail_va) and the virtio split ring layout puts the 16-bit idx right after flags, so no ring
+// library internals are needed. Call under the queue's VioScsiVQLock right after a successful
+// virtqueue_add_buf, which was the last write to idx, and so the entry is at idx - 1. A packed
+// ring has no avail index; 0 is recorded and EventRing.Flags says so.
+static USHORT VioScsiAvailPos(IN PADAPTER_EXTENSION adaptExt, IN struct virtqueue *vq)
+{
+    if (adaptExt->vdev.packed_ring)
+    {
+        return 0;
+    }
+    return (USHORT)(((volatile USHORT *)vq->avail_va)[1] - 1);
+}
+
 VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
@@ -203,6 +218,7 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         element = &adaptExt->processing_srbs[vq_req_idx];
         srbExt->SubmitTime = StorPerfInterruptTime(adaptExt);
         srbExt->OwnedTime = srbExt->SubmitTime;
+        srbExt->AvailPos = VioScsiAvailPos(adaptExt, adaptExt->vq[QueueNumber]);
         srbExt->OwnedMagic = VIOSCSI_SRBEXT_OWNED_MAGIC;
         InsertTailList(&element->srb_list, &srbExt->list_entry);
         element->srb_cnt++;
@@ -970,6 +986,22 @@ VOID VioScsiRecordEvent(IN PADAPTER_EXTENSION adaptExt,
                         IN ULONG64 Value1,
                         IN ULONG64 Value2)
 {
+    VioScsiRecordEventEx(adaptExt, Code, Queue, 0, Target, Lun, Id, SrbExt, Srb, TablePa, Value1, Value2);
+}
+
+VOID VioScsiRecordEventEx(IN PADAPTER_EXTENSION adaptExt,
+                          IN VIOSCSI_EVENT_CODE Code,
+                          IN ULONG Queue,
+                          IN USHORT AvailPos,
+                          IN UCHAR Target,
+                          IN UCHAR Lun,
+                          IN ULONG_PTR Id,
+                          IN PVOID SrbExt,
+                          IN PVOID Srb,
+                          IN ULONG64 TablePa,
+                          IN ULONG64 Value1,
+                          IN ULONG64 Value2)
+{
     PVIOSCSI_EVENT_RING ring = &adaptExt->EventRing;
     PVIOSCSI_EVENT event;
     LONG64 sequence;
@@ -996,7 +1028,7 @@ VOID VioScsiRecordEvent(IN PADAPTER_EXTENSION adaptExt,
     event->Queue = (USHORT)((Queue < VIOSCSI_EVENT_NO_QUEUE) ? Queue : VIOSCSI_EVENT_NO_QUEUE);
     event->Target = Target;
     event->Lun = Lun;
-    event->Reserved = 0;
+    event->AvailPos = AvailPos;
     KeMemoryBarrier();
     event->Sequence = (ULONG64)sequence;
 }
@@ -1008,17 +1040,18 @@ VOID VioScsiRecordSrbEvent(IN PADAPTER_EXTENSION adaptExt,
                            IN ULONG64 Value2)
 {
     // lun[3] is the LUN as VioScsiBuildIo addressed the command; TargetId is the SRB's target.
-    VioScsiRecordEvent(adaptExt,
-                       Code,
-                       SrbExt->QueueIndex,
-                       (UCHAR)SrbExt->TargetId,
-                       SrbExt->cmd.req.cmd.lun[3],
-                       SrbExt->id,
-                       SrbExt,
-                       SrbExt->Srb,
-                       SrbExt->TablePa,
-                       Value1,
-                       Value2);
+    VioScsiRecordEventEx(adaptExt,
+                         Code,
+                         SrbExt->QueueIndex,
+                         SrbExt->AvailPos,
+                         (UCHAR)SrbExt->TargetId,
+                         SrbExt->cmd.req.cmd.lun[3],
+                         SrbExt->id,
+                         SrbExt,
+                         SrbExt->Srb,
+                         SrbExt->TablePa,
+                         Value1,
+                         Value2);
 }
 
 // Zombies[] key for a request: its queue and virtqueue cookie. Cookies are never 0 (SendSRB skips
@@ -1074,6 +1107,8 @@ VOID VioScsiZombieAdd(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt)
     zombie->Time = StorPerfInterruptTime(adaptExt);
     zombie->Reused = 0;
     zombie->Queue = SrbExt->QueueIndex;
+    zombie->AvailPos = SrbExt->AvailPos;
+    zombie->Reserved[0] = zombie->Reserved[1] = zombie->Reserved[2] = 0;
     InterlockedIncrement(&adaptExt->ZombieLive);
     InterlockedExchange64(&zombie->Key, VioScsiZombieKey(SrbExt->QueueIndex, SrbExt->id));
 }
@@ -1105,6 +1140,7 @@ VioScsiZombieTake(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, IN ULONG_PTR I
         Zombie->Time = zombie->Time;
         Zombie->Reused = zombie->Reused;
         Zombie->Queue = zombie->Queue;
+        Zombie->AvailPos = zombie->AvailPos;
         // Fails if VioScsiZombieAdd evicted the entry meanwhile, in which case the copy may be torn
         // and the request is no longer known.
         if (InterlockedCompareExchange64(&zombie->Key, 0, key) == key)

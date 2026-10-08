@@ -161,6 +161,19 @@ VOID VioScsiRecordEvent(IN PADAPTER_EXTENSION adaptExt,
                         IN ULONG64 Value1,
                         IN ULONG64 Value2);
 
+VOID VioScsiRecordEventEx(IN PADAPTER_EXTENSION adaptExt,
+                          IN VIOSCSI_EVENT_CODE Code,
+                          IN ULONG Queue,
+                          IN USHORT AvailPos,
+                          IN UCHAR Target,
+                          IN UCHAR Lun,
+                          IN ULONG_PTR Id,
+                          IN PVOID SrbExt,
+                          IN PVOID Srb,
+                          IN ULONG64 TablePa,
+                          IN ULONG64 Value1,
+                          IN ULONG64 Value2);
+
 VOID VioScsiRecordSrbEvent(IN PADAPTER_EXTENSION adaptExt,
                            IN VIOSCSI_EVENT_CODE Code,
                            IN PSRB_EXTENSION SrbExt,

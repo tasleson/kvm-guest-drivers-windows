@@ -273,6 +273,7 @@ typedef struct _SRB_EXTENSION
     // ADAPTER_EXTENSION.Zombies instead: BuildIo zeroes these fields with the rest.
     ULONG OwnedMagic;  // VIOSCSI_SRBEXT_OWNED_MAGIC while the device holds this request
     ULONG64 OwnedTime; // StorPerfInterruptTime() when SendSRB published it
+    USHORT AvailPos;   // split ring: avail ring index the request was published at (VioScsiAvailPos)
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
 
@@ -656,8 +657,16 @@ StorPerfTargetActive(IN PTARGET_TELEMETRY Target)
 // same on every architecture; the event codes below say what Id, Value1 and Value2 hold. Not
 // recorded in dump mode.
 //
+// Every event about a request also carries AvailPos, the split ring avail index the request was
+// published at: the free-running 16-bit value of avail->idx before the add, the same number QEMU
+// counts as the position of an avail entry. Together with the virtio queue number (Queue +
+// VIRTIO_SCSI_REQUEST_QUEUE_0: QEMU numbers the control and event queues 0 and 1) it names the
+// exact entry a QEMU error about a descriptor chain refers to. A packed ring has no avail index:
+// the ring's Flags say so and AvailPos is 0 throughout.
+//
 #define VIOSCSI_EVENT_RING_MAGIC   0x47525645 // 'EVRG' in memory byte order
-#define VIOSCSI_EVENT_RING_VERSION 1
+#define VIOSCSI_EVENT_RING_VERSION 2
+#define VIOSCSI_EVENT_RING_PACKED  0x1 // Flags: packed virtqueues, so no AvailPos is recorded
 #define VIOSCSI_EVENT_RING_SIZE    8192 // a power of two
 #define VIOSCSI_EVENT_NO_QUEUE     0xFFFF
 
@@ -741,7 +750,7 @@ typedef struct _VIOSCSI_EVENT
     USHORT Queue; // request queue index (processing_srbs/Telemetry.Queues), VIOSCSI_EVENT_NO_QUEUE if none
     UCHAR Target;
     UCHAR Lun;
-    USHORT Reserved;
+    USHORT AvailPos; // avail ring index the request was published at (see above), 0 if none
 } VIOSCSI_EVENT, *PVIOSCSI_EVENT;
 
 typedef struct _VIOSCSI_EVENT_RING
@@ -751,6 +760,8 @@ typedef struct _VIOSCSI_EVENT_RING
     ULONG EntrySize;      // sizeof(VIOSCSI_EVENT)
     ULONG EntryCount;     // VIOSCSI_EVENT_RING_SIZE
     volatile LONG64 Next; // events recorded so far; event N (1-based) is in Entries[(N - 1) % EntryCount]
+    ULONG Flags;          // VIOSCSI_EVENT_RING_PACKED (version 2)
+    ULONG Reserved;
     VIOSCSI_EVENT Entries[VIOSCSI_EVENT_RING_SIZE];
 } VIOSCSI_EVENT_RING, *PVIOSCSI_EVENT_RING;
 
@@ -781,15 +792,17 @@ typedef struct _VIOSCSI_ZOMBIE
     ULONG64 Time;         // StorPerfInterruptTime() when it was completed early
     volatile LONG Reused; // nonzero once VioScsiBuildIo was handed SrbExt for another request
     ULONG Queue;          // request queue index
+    USHORT AvailPos;      // avail ring index it was published at
+    USHORT Reserved[3];
 } VIOSCSI_ZOMBIE, *PVIOSCSI_ZOMBIE;
 
 C_ASSERT((VIOSCSI_ZOMBIE_SLOTS & (VIOSCSI_ZOMBIE_SLOTS - 1)) == 0);
-C_ASSERT(sizeof(VIOSCSI_ZOMBIE) == 56);
+C_ASSERT(sizeof(VIOSCSI_ZOMBIE) == 64);
 C_ASSERT(VIOSCSI_ZOMBIE_PROBES >= 1 && VIOSCSI_ZOMBIE_PROBES <= VIOSCSI_ZOMBIE_SLOTS);
 
 C_ASSERT((VIOSCSI_EVENT_RING_SIZE & (VIOSCSI_EVENT_RING_SIZE - 1)) == 0);
 C_ASSERT(sizeof(VIOSCSI_EVENT) == 72);
-C_ASSERT(FIELD_OFFSET(VIOSCSI_EVENT_RING, Entries) == 24);
+C_ASSERT(FIELD_OFFSET(VIOSCSI_EVENT_RING, Entries) == 32);
 
 typedef struct virtio_bar
 {
