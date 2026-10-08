@@ -66,7 +66,7 @@ VIOSCSI_TELEMETRY_DIRECTORY VioScsiTelemetryDirectory =
     0,                                          // Reserved
     { NULL },                                   // Adapters
     FIELD_OFFSET(ADAPTER_EXTENSION, EventRing), // EventRingOffset
-    0,                                          // Reserved2
+    FIELD_OFFSET(ADAPTER_EXTENSION, Zombies),   // ZombiesOffset
 };
 // clang-format on
 
