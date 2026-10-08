@@ -11,10 +11,14 @@
 //   dx @$vioscsiTelemetry()                the same data as data model objects
 //   dx -r3 @$vioscsiTelemetry()[0].Queues  drill into per-queue values and raw histograms
 //   dx @$vioscsiTelemetry()[0].Targets     per-SCSI-target values (active targets only)
-//   !vioscsi_events [adapter] [table PA] [count]
+//   !vioscsi_events [adapter] [table PA] [count] [virtqueue] [avail pos]
 //                                          the adapter's event ring: the last <count> events
-//                                          (default 64), or with a table PA every event of the
-//                                          request(s) whose indirect descriptor table is there
+//                                          (default 64), or every event of the request(s) whose
+//                                          indirect descriptor table is at <table PA> or that were
+//                                          published at <avail pos> of <virtqueue> (QEMU numbering)
+//   !vioscsi_chain <table PA> <virtqueue> <avail pos>
+//                                          the same for every adapter, taking the addr=, queue= and
+//                                          pos= of a QEMU virtqueue_chain_error line
 //   dx @$vioscsiEvents([adapter])          the decoded event rings and outstanding zombies
 //
 // With matching vioscsi symbols, !vioscsi_telemetry reads vioscsi!VioScsiTelemetryDirectory
@@ -121,19 +125,30 @@ const DIRECTORY_MAX_TELEMETRY_OFFSET = 4 * 1024 * 1024;
 // after Adapters[].
 const DIRECTORY_EVENTS_VERSION = 2;
 const DIRECTORY_MAX_EXTENSION_OFFSET = 16 * 1024 * 1024;
-// VIOSCSI_EVENT_RING: Magic, Version, EntrySize, EntryCount (ULONGs), Next (ULONG64), then
-// Entries[EntryCount]. VIOSCSI_EVENT: Sequence, Time, TablePa, Id, SrbExt, Srb, Value1, Value2
-// (ULONG64s), then Code, Queue (USHORTs), Target, Lun (UCHARs) and a USHORT of padding.
+// VIOSCSI_EVENT_RING: Magic, Version, EntrySize, EntryCount (ULONGs), Next (ULONG64), from
+// version 2 Flags and Reserved (ULONGs), then Entries[EntryCount]. VIOSCSI_EVENT: Sequence, Time,
+// TablePa, Id, SrbExt, Srb, Value1, Value2 (ULONG64s), then Code, Queue (USHORTs), Target, Lun
+// (UCHARs) and AvailPos (USHORT, version 2; padding before).
 const VIOSCSI_EVENT_RING_MAGIC = 0x47525645; // 'EVRG'
-const EVENT_RING_HEADER_SIZE = 24;
+const EVENT_RING_V1_HEADER_SIZE = 24;
+const EVENT_RING_V2_HEADER_SIZE = 32;
+const EVENT_RING_PACKED = 0x1; // Flags: packed virtqueues, no AvailPos recorded
 const EVENT_SLOTS = 9;
 const EVENT_RING_MAX_ENTRIES = 1 << 20;
+// Entries read per memory request; the ring holds 32768 of them (2.3 MB).
+const EVENT_READ_CHUNK = 2048;
 const EVENT_NO_QUEUE = 0xFFFF;
 const EVENTS_DEFAULT_COUNT = 64;
-// VIOSCSI_ZOMBIE[VIOSCSI_ZOMBIE_SLOTS]: Key, Id, SrbExt, Srb, TablePa, Time (ULONG64s), then
-// Reused and Queue (ULONGs).
+// QEMU numbers virtqueues from the control (0) and event (1) queues; the ring records request
+// queue indexes, so request queue N is QEMU's virtqueue N + 2 (VIRTIO_SCSI_REQUEST_QUEUE_0).
+const VIRTIO_SCSI_REQUEST_QUEUE_0 = 2;
+// VIOSCSI_ZOMBIE[VIOSCSI_ZOMBIE_SLOTS]: Key, Id, SrbExt, Srb, TablePa, Time (ULONG64s), Reused and
+// Queue (ULONGs), then AvailPos (USHORT) and padding to 64 bytes.
 const VIOSCSI_ZOMBIE_SLOTS = 1024;
-const ZOMBIE_SLOTS = 7;
+const ZOMBIE_SLOTS = 8;
+// Events whose AvailPos names a request's avail entry. An OrphanReturn has one only when it
+// matched an early-completed request (VIOSCSI_ORPHAN_EARLY_COMPLETED).
+const EVENTS_WITH_POS = new Set([1, 2, 4, 12, 16]);
 const EVENT_NAMES = {
     1: "Publish", 2: "DeviceComplete", 3: "OrphanReturn", 4: "EarlyComplete", 5: "ResetRequest",
     6: "ResetDone", 7: "TmfSent", 8: "TmfCoalesced", 9: "TmfComplete", 10: "Pause", 11: "Resume",
@@ -1196,8 +1211,15 @@ function decodeEvent(v, base) {
         Code: lo & 0xFFFF,
         Queue: lo >>> 16,
         Target: hi & 0xFF,
-        Lun: (hi >>> 8) & 0xFF
+        Lun: (hi >>> 8) & 0xFF,
+        AvailPos: hi >>> 16
     };
+}
+
+// True if the event names an avail entry, so its Queue/AvailPos can be compared with QEMU's.
+function eventHasPos(e) {
+    return e.Queue !== EVENT_NO_QUEUE &&
+           (EVENTS_WITH_POS.has(e.Code) || (e.Code === 3 && (high32(e.Value1) & 1) !== 0));
 }
 
 // Reads a VIOSCSI_EVENT_RING; events come back oldest first. An entry is kept only if its
@@ -1214,17 +1236,29 @@ function readEventRing(ring) {
                         ", EntryCount " + entryCount);
     }
     const next = num(readValues(ring.add(16), 1, 8)[0]);
+    const flags = version >= 2 ? low32(readValues(ring.add(24), 1, 4)[0]) : 0;
+    const entries = ring.add(version >= 2 ? EVENT_RING_V2_HEADER_SIZE : EVENT_RING_V1_HEADER_SIZE);
     const slots = entrySize / 8;
-    const v = readValues(ring.add(EVENT_RING_HEADER_SIZE), entryCount * slots, 8);
     const events = [];
-    for (let i = 0; i < entryCount; i++) {
-        const e = decodeEvent(v, i * slots);
-        if (e.Sequence !== 0 && (e.Sequence - 1) % entryCount === i) {
-            events.push(e);
+    for (let first = 0; first < entryCount; first += EVENT_READ_CHUNK) {
+        const count = Math.min(EVENT_READ_CHUNK, entryCount - first);
+        const v = readValues(entries.add(first * entrySize), count * slots, 8);
+        for (let j = 0; j < count; j++) {
+            const e = decodeEvent(v, j * slots);
+            if (e.Sequence !== 0 && (e.Sequence - 1) % entryCount === first + j) {
+                if (version < 2) {
+                    e.AvailPos = 0; // padding before version 2
+                }
+                events.push(e);
+            }
         }
     }
     events.sort((a, b) => a.Sequence - b.Sequence);
-    return { Address: ring, Version: version, Recorded: next, EntryCount: entryCount, Events: events };
+    return {
+        Address: ring, Version: version, Recorded: next, EntryCount: entryCount, Events: events,
+        // No avail positions: a ring from before they were recorded, or packed virtqueues.
+        NoAvailPos: version < 2 || (flags & EVENT_RING_PACKED) !== 0, Packed: (flags & EVENT_RING_PACKED) !== 0
+    };
 }
 
 // Live entries of an adapter's Zombies[]: requests completed early that the device hasn't
@@ -1239,7 +1273,7 @@ function readZombies(address) {
         }
         zombies.push({
             Slot: i, Id: v[b + 1], SrbExt: v[b + 2], Srb: v[b + 3], TablePa: v[b + 4], Time: num(v[b + 5]),
-            Reused: low32(v[b + 6]) !== 0, Queue: high32(v[b + 6])
+            Reused: low32(v[b + 6]) !== 0, Queue: high32(v[b + 6]), AvailPos: low32(v[b + 7]) & 0xFFFF
         });
     }
     return zombies;
@@ -1318,9 +1352,12 @@ function describeEvent(e) {
         case 11:
             return EVENT_SITE_NAMES[num(v2)] || "site " + num(v2);
         case 12: {
+            // VIOSCSI_REUSE_STILL_MARKED 1, _AGAIN 2, _IN_ZOMBIES 4.
             const flags = num(v2);
-            return "DEVICE STILL HOLDS request " + hex(e.Id) + " completed early " + fmtUs(hnsToUs(num(v1))) +
-                   " before" + ((flags & 1) ? ", ownership mark still set" : "") +
+            return ((flags & 4) ? "DEVICE STILL HOLDS request " + hex(e.Id) :
+                                  "request " + hex(e.Id) + " MAY STILL BE HELD (marked, but no zombie entry: " +
+                                  "evicted from a full table, or already returned)") +
+                   ((flags & 1) ? ", published " : ", completed early ") + fmtUs(hnsToUs(num(v1))) + " before" +
                    ((flags & 2) ? ", reused before" : "");
         }
         case 13:
@@ -1338,25 +1375,69 @@ function describeEvent(e) {
     }
 }
 
-// Events of the request(s) whose indirect table is at tablePa: those recording that table, plus
-// those of the same SRB extensions (the table lives in the extension, so this also catches
-// events recorded before the table address was known, such as a refused scatter/gather list).
-function eventsForTable(events, tablePa) {
+// A filter on the requests a QEMU report names: the indirect table address (addr=) and/or the
+// virtqueue and avail position (queue=, pos=; QEMU's virtqueue numbering). Any part may be absent.
+function chainFilter(tablePa, virtqueue, pos) {
+    const f = {};
+    if (tablePa !== undefined && !isZero(tablePa)) {
+        f.TablePa = tablePa;
+    }
+    if (virtqueue !== undefined && pos !== undefined && num(virtqueue) >= VIRTIO_SCSI_REQUEST_QUEUE_0) {
+        f.Queue = num(virtqueue) - VIRTIO_SCSI_REQUEST_QUEUE_0;
+        f.Pos = num(pos) & 0xFFFF;
+    }
+    return (f.TablePa !== undefined || f.Queue !== undefined) ? f : null;
+}
+
+function describeFilter(f) {
+    const parts = [];
+    if (f.TablePa !== undefined) {
+        parts.push("table " + hex(f.TablePa));
+    }
+    if (f.Queue !== undefined) {
+        parts.push("virtqueue " + (f.Queue + VIRTIO_SCSI_REQUEST_QUEUE_0) + " avail pos " + f.Pos);
+    }
+    return parts.join(" or ");
+}
+
+// Matches an event (or zombie, which has the same fields) directly: by table, or by avail entry.
+// noPos: the ring records no avail positions, so only the table can match.
+function matchesChain(e, f, noPos, isZombie) {
+    if (f.TablePa !== undefined && !isZero(e.TablePa) && sameAddress(e.TablePa, f.TablePa)) {
+        return true;
+    }
+    return f.Queue !== undefined && !noPos && (isZombie || eventHasPos(e)) && e.Queue === f.Queue &&
+           e.AvailPos === f.Pos;
+}
+
+// Events of the request(s) a filter names, plus every event of the same SRB extensions: the table
+// lives in the extension, so this also shows what else used that memory (the reuse that matters)
+// and events recorded before the table address was known, such as a refused scatter/gather list.
+function eventsForChain(events, f, noPos) {
     const exts = new Set();
     for (const e of events) {
-        if (sameAddress(e.TablePa, tablePa) && !isZero(e.SrbExt)) {
+        if (matchesChain(e, f, noPos, false) && !isZero(e.SrbExt)) {
             exts.add(hex(e.SrbExt).toLowerCase());
         }
     }
-    return events.filter(e => sameAddress(e.TablePa, tablePa) ||
+    return events.filter(e => matchesChain(e, f, noPos, false) ||
                               (!isZero(e.SrbExt) && exts.has(hex(e.SrbExt).toLowerCase())));
+}
+
+// QEMU's name for an event's avail entry: virtqueue:pos.
+function fmtVqPos(e, noPos) {
+    if (e.Queue === EVENT_NO_QUEUE) {
+        return "-";
+    }
+    const vq = e.Queue + VIRTIO_SCSI_REQUEST_QUEUE_0;
+    return (noPos || !(e.AvailPos !== undefined && (e.IsZombie || eventHasPos(e)))) ? vq + ":-" : vq + ":" + e.AvailPos;
 }
 
 const EVENT_COLUMNS = [
     { name: "Seq", value: e => e.Sequence },
     { name: "Age", value: e => e.AgeUs === null ? "-" : fmtUs(e.AgeUs) },
     { name: "Event", value: e => EVENT_NAMES[e.Code] || "code " + e.Code },
-    { name: "Q", value: e => e.Queue === EVENT_NO_QUEUE ? "-" : e.Queue },
+    { name: "VQ:Pos", value: e => fmtVqPos(e, e.NoPos) },
     { name: "T:L", value: e => e.Target + ":" + e.Lun },
     { name: "Id", value: e => isZero(e.Id) ? "-" : hex(e.Id) },
     { name: "TablePa", value: e => isZero(e.TablePa) ? "-" : hex(e.TablePa) },
@@ -1367,7 +1448,7 @@ const EVENT_COLUMNS = [
 
 const ZOMBIE_COLUMNS = [
     { name: "Slot", value: z => z.Slot },
-    { name: "Q", value: z => z.Queue },
+    { name: "VQ:Pos", value: z => fmtVqPos(z, z.NoPos) },
     { name: "Id", value: z => hex(z.Id) },
     { name: "TablePa", value: z => hex(z.TablePa) },
     { name: "SrbExt", value: z => hex(z.SrbExt) },
@@ -1376,30 +1457,48 @@ const ZOMBIE_COLUMNS = [
     { name: "ExtReused", value: z => z.Reused ? "yes" : "no" }
 ];
 
-function printEventRing(r, tablePa, count) {
+// Prints an adapter's ring: the last <count> events, or those a chainFilter selects. Returns the
+// number of events shown.
+function printEventRing(r, filter, count, quietIfNone) {
+    let shown;
+    if (filter) {
+        shown = eventsForChain(r.Events, filter, r.NoAvailPos);
+        if (shown.length === 0 && quietIfNone) {
+            return 0;
+        }
+    } else {
+        shown = r.Events.slice(-count);
+    }
     // Ages are against the dump/session's interrupt time, or the newest event without one.
     const newest = r.Events.length ? r.Events[r.Events.length - 1].Time : 0;
-    const now = readInterruptTimeHns() || newest;
-    r.Events.forEach(e => e.AgeUs = ageUs(now, e.Time));
-    r.Zombies.forEach(z => z.AgeUs = ageUs(now, z.Time));
+    const dumpNow = readInterruptTimeHns();
+    const now = dumpNow || newest;
+    r.Events.forEach(e => {
+        e.AgeUs = ageUs(now, e.Time);
+        e.NoPos = r.NoAvailPos;
+    });
+    r.Zombies.forEach(z => {
+        z.AgeUs = ageUs(now, z.Time);
+        z.NoPos = r.NoAvailPos;
+        z.IsZombie = true;
+    });
     log("");
     log("== adapter " + hex(r.Adapter) + " event ring " + hex(r.Address) + ": " + r.Recorded +
         " events recorded, the last " + r.Events.length + " kept; ages relative to " +
-        (readInterruptTimeHns() ? "the dump/session interrupt time" : "the newest event"));
-    let shown;
-    if (tablePa !== undefined && !isZero(tablePa)) {
-        shown = eventsForTable(r.Events, tablePa);
-        log("Events for the request(s) with table " + hex(tablePa) + ": " + shown.length);
-    } else {
-        shown = r.Events.slice(-count);
-        log("Last " + shown.length + " events:");
+        (dumpNow ? "the dump/session interrupt time" : "the newest event"));
+    if (r.NoAvailPos) {
+        log("No avail positions recorded (" + (r.Packed ? "packed virtqueues" : "driver predates them") +
+            "): only the table address can be matched.");
     }
+    log(filter ? "Events for the request(s) at " + describeFilter(filter) + ", with every other use of their SRB " +
+                 "extensions: " + shown.length
+               : "Last " + shown.length + " events:");
     if (shown.length) {
         fmtTable(EVENT_COLUMNS, shown);
     }
     let zombies = r.Zombies;
-    if (tablePa !== undefined && !isZero(tablePa)) {
-        zombies = zombies.filter(z => sameAddress(z.TablePa, tablePa));
+    if (filter) {
+        zombies = zombies.filter(z => matchesChain(z, filter, r.NoAvailPos, true));
     }
     log("");
     log("Requests completed early that the device has not returned: " + zombies.length +
@@ -1407,17 +1506,43 @@ function printEventRing(r, tablePa, count) {
     if (zombies.length) {
         fmtTable(ZOMBIE_COLUMNS, zombies);
     }
+    return shown.length;
 }
 
-// !vioscsi_events [adapter extension, 0 = all registered] [table PA, 0 = none] [count]
-function printEvents(address, tablePa, count) {
+// !vioscsi_events [adapter extension, 0 = all registered] [table PA, 0 = none] [count, 0 = 64]
+//                 [virtqueue] [avail pos]
+function printEvents(address, tablePa, count, virtqueue, pos) {
     run(() => {
         const n = (count === undefined || isZero(count)) ? EVENTS_DEFAULT_COUNT : num(count);
         const rings = vioscsiEvents(address);
         if (rings.length === 0) {
             log("No vioscsi adapter with an event ring found");
         }
-        rings.forEach(r => printEventRing(r, tablePa, n));
+        const filter = chainFilter(tablePa, virtqueue, pos);
+        rings.forEach(r => printEventRing(r, filter, n, false));
+    });
+}
+
+// !vioscsi_chain <table PA> [virtqueue] [avail pos]: the addr=, queue= and pos= of a QEMU
+// virtqueue_chain_error line. QEMU's dev= names the adapter by QEMU id, which the guest doesn't
+// know, so every adapter is searched and only those with a match are printed.
+function printChain(tablePa, virtqueue, pos) {
+    run(() => {
+        const filter = chainFilter(tablePa, virtqueue, pos);
+        if (!filter) {
+            throw new Error("usage: !vioscsi_chain <table PA> [<virtqueue> <avail pos>]");
+        }
+        let matched = 0;
+        for (const r of vioscsiEvents(undefined)) {
+            matched += printEventRing(r, filter, 0, true) ? 1 : 0;
+        }
+        if (matched === 0) {
+            log("No event in any adapter's ring matches " + describeFilter(filter) +
+                ": the request is older than the ring, or the address is not one of this guest's tables.");
+        } else if (matched > 1 && filter.TablePa === undefined) {
+            log("warning: " + matched + " adapters have an entry at that virtqueue and position; " +
+                "add the table address to tell them apart.");
+        }
     });
 }
 
@@ -1428,6 +1553,7 @@ function initializeScript() {
         new host.functionAlias(printTelemetryAt, "vioscsi_telemetry_at"),
         new host.functionAlias(printTelemetryScan, "vioscsi_telemetry_scan"),
         new host.functionAlias(printEvents, "vioscsi_events"),
+        new host.functionAlias(printChain, "vioscsi_chain"),
         new host.functionAlias(vioscsiEvents, "vioscsiEvents"),
         new host.functionAlias(vioscsiTelemetry, "vioscsiTelemetry"),
         new host.functionAlias(vioscsiTelemetryAt, "vioscsiTelemetryAt"),
