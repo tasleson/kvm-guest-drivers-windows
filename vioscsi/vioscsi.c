@@ -1535,6 +1535,115 @@ static VOID CheckExtensionStillReferenced(IN PADAPTER_EXTENSION adaptExt,
                  zombie->TablePa);
 }
 
+// FALSE for the SRB functions PreProcessRequest completes itself: their data buffers (WMI and
+// IOCTL payloads such as the telemetry snapshot) never become descriptors, so their
+// scatter/gather lists are not checked. Keep in step with PreProcessRequest.
+static BOOLEAN SrbGoesToDevice(IN PSCSI_REQUEST_BLOCK Srb)
+{
+    switch (SRB_FUNCTION(Srb))
+    {
+        case SRB_FUNCTION_PNP:
+        case SRB_FUNCTION_POWER:
+        case SRB_FUNCTION_RESET_BUS:
+        case SRB_FUNCTION_RESET_DEVICE:
+        case SRB_FUNCTION_RESET_LOGICAL_UNIT:
+        case SRB_FUNCTION_WMI:
+        case SRB_FUNCTION_IO_CONTROL:
+            return FALSE;
+        default:
+            return TRUE;
+    }
+}
+
+// Checks a request's scatter/gather list before VioScsiBuildIo turns it into descriptors. QEMU
+// treats a zero-length descriptor as a device error and stops servicing every queue of the
+// adapter, so one bad element would take down every LUN behind it: refuse the request instead.
+// More elements than max_physical_breaks + 1 used to be cut off silently (sgMaxElements), sending
+// the device a shorter buffer than the command describes, so refuse that too. A length total that
+// doesn't match DataTransferLength is only recorded. Returns FALSE to refuse the request.
+static BOOLEAN ValidateScatterGatherList(IN PADAPTER_EXTENSION adaptExt,
+                                         IN PSRB_EXTENSION srbExt,
+                                         IN PSCSI_REQUEST_BLOCK Srb,
+                                         IN PSTOR_SCATTER_GATHER_LIST sgList,
+                                         IN UCHAR TargetId,
+                                         IN UCHAR Lun)
+{
+    ULONG count = sgList->NumberOfElements;
+    ULONG limit = adaptExt->max_physical_breaks + 1;
+    ULONG transferLength = SRB_DATA_TRANSFER_LENGTH(Srb);
+    ULONG64 request = ((ULONG64)SRB_FLAGS(Srb) << 32) | transferLength;
+    ULONG64 sum = 0;
+    ULONG i;
+
+    if (count > limit)
+    {
+        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.SgTooManyElementsCount);
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventSgTooManyElements,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           TargetId,
+                           Lun,
+                           SRB_FUNCTION(Srb),
+                           srbExt,
+                           Srb,
+                           0,
+                           ((ULONG64)count << 32) | limit,
+                           request);
+        RhelDbgPrint(TRACE_LEVEL_ERROR,
+                     " SRB 0x%p has %lu scatter/gather elements, more than %lu, refusing it\n",
+                     Srb,
+                     count,
+                     limit);
+        return FALSE;
+    }
+    for (i = 0; i < count; i++)
+    {
+        if (sgList->List[i].Length == 0)
+        {
+            InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.SgZeroLengthCount);
+            VioScsiRecordEvent(adaptExt,
+                               VioScsiEventSgZeroLength,
+                               VIOSCSI_EVENT_NO_QUEUE,
+                               TargetId,
+                               Lun,
+                               SRB_FUNCTION(Srb),
+                               srbExt,
+                               Srb,
+                               0,
+                               ((ULONG64)i << 32) | count,
+                               request);
+            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                         " SRB 0x%p scatter/gather element %lu of %lu has zero length, refusing it\n",
+                         Srb,
+                         i,
+                         count);
+            return FALSE;
+        }
+        sum += sgList->List[i].Length;
+    }
+    if (sum != transferLength)
+    {
+        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.SgLengthMismatchCount);
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventSgLengthMismatch,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           TargetId,
+                           Lun,
+                           SRB_FUNCTION(Srb),
+                           srbExt,
+                           Srb,
+                           0,
+                           sum,
+                           request);
+        RhelDbgPrint(TRACE_LEVEL_WARNING,
+                     " SRB 0x%p scatter/gather lengths add up to %I64u, DataTransferLength is %lu\n",
+                     Srb,
+                     sum,
+                     transferLength);
+    }
+    return TRUE;
+}
+
 BOOLEAN
 VioScsiBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 {
@@ -1616,6 +1725,13 @@ VioScsiBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     sgElement++;
 
     sgList = StorPortGetScatterGatherList(DeviceExtension, Srb);
+    if (sgList && SrbGoesToDevice(Srb) && !ValidateScatterGatherList(adaptExt, srbExt, Srb, sgList, TargetId, Lun))
+    {
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_INVALID_REQUEST);
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        StorPortNotification(RequestComplete, DeviceExtension, Srb);
+        return FALSE;
+    }
     if (sgList)
     {
         sgMaxElements = min((adaptExt->max_physical_breaks + 1), sgList->NumberOfElements);

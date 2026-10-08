@@ -43,6 +43,39 @@
         pa = va ? StorPortGetPhysicalAddress(DeviceExtension, NULL, va, &len).QuadPart : 0;                            \
     }
 
+// Re-reads the indirect table virtqueue_add_buf just built for a request. VioScsiBuildIo already
+// refuses zero-length scatter/gather elements and the command and response headers have fixed
+// sizes, so this should never fire; if it does, the zero came from building the descriptors,
+// not from anything that touched the table after it was published. Called under the queue's
+// VioScsiVQLock right after a successful add.
+static VOID CheckPublishedTable(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION srbExt)
+{
+    ULONG count = srbExt->out + srbExt->in;
+    ULONG i;
+
+    for (i = 0; i < count && i < VIRTIO_MAX_SG; i++)
+    {
+        // desc_alias holds split ring (struct vring_desc) or packed ring (struct vring_packed_desc)
+        // entries; both start with the 64-bit address followed by the 32-bit length.
+        if ((srbExt->pdesc[i].u.data[1] & 0xFFFFFFFFULL) == 0)
+        {
+            InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.ZeroLengthDescCount);
+            VioScsiRecordSrbEvent(adaptExt,
+                                  VioScsiEventZeroLengthDesc,
+                                  srbExt,
+                                  ((ULONG64)i << 32) | count,
+                                  srbExt->pdesc[i].u.data[0]);
+            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                         " SRB 0x%p published a zero-length descriptor at %lu of %lu, table 0x%I64x\n",
+                         srbExt->Srb,
+                         i,
+                         count,
+                         srbExt->TablePa);
+            return;
+        }
+    }
+}
+
 VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
@@ -185,6 +218,12 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                               srbExt,
                               srbExt->out | ((ULONG64)srbExt->in << 16),
                               srbExt->Xfer);
+        if (va != NULL)
+        {
+            // A successful add with a table always goes indirect: a request has at least the
+            // command and response headers, and a ring with no free descriptor fails the add.
+            CheckPublishedTable(adaptExt, srbExt);
+        }
     }
     else
     {

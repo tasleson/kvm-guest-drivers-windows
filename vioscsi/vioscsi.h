@@ -481,6 +481,13 @@ typedef struct _STOR_TELEMETRY
     ULONG64 OrphanIntoReusedExtCount; // ...of those, ones whose extension already served another request
     ULONG64 ZombieEvictedCount;       // early-completed requests forgotten because Zombies[] was full
 
+    // Request validation (version 6). A zero-length descriptor makes QEMU mark the whole device
+    // broken, so VioScsiBuildIo refuses requests that would produce one.
+    ULONG64 SgZeroLengthCount;      // requests refused for a zero-length scatter/gather element
+    ULONG64 SgTooManyElementsCount; // requests refused for more elements than max_physical_breaks + 1
+    ULONG64 SgLengthMismatchCount;  // element lengths didn't add up to DataTransferLength (recorded only)
+    ULONG64 ZeroLengthDescCount;    // SendSRB found a zero length in the descriptor table it just published
+
     QUEUE_TELEMETRY Queues[MAX_CPU];
     TARGET_TELEMETRY Targets[STOR_TELEMETRY_MAX_TARGETS]; // must remain the last member
 } STOR_TELEMETRY, *PSTOR_TELEMETRY;
@@ -502,7 +509,8 @@ C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, SnapshotTime) == 104);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, TargetScanTime) == 120);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, EarlyCompletedCount) == 128);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, ZombieEvictedCount) == 168);
-C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) == 176);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, ZeroLengthDescCount) == 200);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) == 208);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) % sizeof(ULONG64) == 0);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Targets) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CPU * sizeof(QUEUE_TELEMETRY));
 C_ASSERT(sizeof(STOR_TELEMETRY) ==
@@ -687,6 +695,18 @@ typedef enum _VIOSCSI_EVENT_CODE
     // old response. Queue, Id and TablePa: that earlier request; Srb, Target and Lun: the new one.
     // Value1: 100 ns since the earlier request was completed early, Value2: VIOSCSI_REUSE_*.
     VioScsiEventExtReused = 12,
+    // VioScsiBuildIo refused a request with a zero-length scatter/gather element. Id: SRB function,
+    // Value1: element index << 32 | NumberOfElements, Value2: SRB flags << 32 | DataTransferLength.
+    VioScsiEventSgZeroLength = 13,
+    // VioScsiBuildIo refused a request with more elements than max_physical_breaks + 1. Id: SRB
+    // function, Value1: NumberOfElements << 32 | that limit, Value2: as for VioScsiEventSgZeroLength.
+    VioScsiEventSgTooManyElements = 14,
+    // The element lengths don't add up to DataTransferLength (recorded only, the request proceeds).
+    // Id: SRB function, Value1: sum of the element lengths, Value2: as for VioScsiEventSgZeroLength.
+    VioScsiEventSgLengthMismatch = 15,
+    // SendSRB found a zero length in the indirect table it had just published. Value1: entry index
+    // << 32 | out + in, Value2: the entry's address.
+    VioScsiEventZeroLengthDesc = 16,
 } VIOSCSI_EVENT_CODE;
 
 // VioScsiEventOrphanReturn Value1 bits 32-63.
