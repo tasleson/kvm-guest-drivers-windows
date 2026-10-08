@@ -1124,7 +1124,8 @@ VOID VioScsiZombieAdd(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt)
 }
 
 // The device returned cookie Id on Queue and no request list holds it. If it belongs to a request
-// completed early, remove that entry and return a copy of it.
+// completed early, remove that entry and return a copy of it. *Zombie is left untouched when no
+// entry matches, and zeroed when the matching entry was evicted while being copied.
 BOOLEAN
 VioScsiZombieTake(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, IN ULONG_PTR Id, OUT PVIOSCSI_ZOMBIE Zombie)
 {
@@ -1160,6 +1161,8 @@ VioScsiZombieTake(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, IN ULONG_PTR I
             Zombie->Key = key;
             return TRUE;
         }
+        // The copy may mix the evicted request with the one replacing it; don't hand it back.
+        RtlZeroMemory(Zombie, sizeof(*Zombie));
         return FALSE;
     }
     return FALSE;
