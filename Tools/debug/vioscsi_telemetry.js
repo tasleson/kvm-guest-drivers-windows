@@ -72,6 +72,13 @@ const RESET_FIELDS = ["BusResetCount", "DeviceResetCount", "LogicalUnitResetCoun
                       "MaxResetDurationUs", "DeviceResetTmfInFlightCount"];
 // After RESET_FIELDS: LastResetTime, SnapshotTime, OutOfRangeTargetCount, TargetScanTime.
 const HEADER_TAIL_FIELDS = ["LastResetTime", "SnapshotTime", "OutOfRangeTargetCount", "TargetScanTime"];
+// Version 6 appends descriptor ownership and request validation counters at HEADER_SIZE.
+const OWNERSHIP_FIELDS = ["EarlyCompletedCount", "ExtReusedWhileOwnedCount", "OrphanReturnCount",
+                          "OrphanUnexplainedCount", "OrphanIntoReusedExtCount", "ZombieEvictedCount",
+                          "SgZeroLengthCount", "SgTooManyElementsCount", "SgLengthMismatchCount",
+                          "ZeroLengthDescCount"];
+const OWNERSHIP_VERSION = 6;
+const OWNERSHIP_HEADER_SIZE = HEADER_SIZE + OWNERSHIP_FIELDS.length * 8;
 // QUEUE_TELEMETRY, in ULONG64 slots: 7 counters, Buckets[B], Count/SumUs/MinUs/MaxUs,
 // StatusHistogram[S], InFlightHighWaterMark + Reserved (two ULONGs), QueueFullCount, then six
 // ULONG64s (OldestInFlightTime, LastCompletionTime, MaxLatencyTime, Slow1sCount, Slow5sCount,
@@ -272,7 +279,8 @@ function summarizeTargets(targets, now, scanTime) {
 }
 
 // Builds the normalized per-adapter result shared by the typed and raw paths.
-// header: { Version, LatencyBuckets, StatusSlots, <RESET_FIELDS>, <HEADER_TAIL_FIELDS> }
+// header: { Version, LatencyBuckets, StatusSlots, <RESET_FIELDS>, <HEADER_TAIL_FIELDS>,
+//          <OWNERSHIP_FIELDS> (version 6 and later only) }
 // targets: every entry read, active or not.
 function summarize(source, header, queues, targets, typed) {
     const total = { Queue: "Total", MinUs: 0, MaxUs: 0, InFlightHwm: 0 };
@@ -335,6 +343,12 @@ function summarize(source, header, queues, targets, typed) {
     result.OutOfRangeTargetCount = header.OutOfRangeTargetCount;
     result.TargetScanTime = header.TargetScanTime;
     result.TargetScanAgeUs = ageUs(now, header.TargetScanTime);
+    // Left undefined for older drivers, so the summary can tell "none" from "not counted".
+    OWNERSHIP_FIELDS.forEach(f => {
+        if (header[f] !== undefined) {
+            result[f] = header[f];
+        }
+    });
     result.AgesRelativeTo = nowSource;
     result.Queues = queues;
     // Targets: the ones that have seen activity; AllTargets: every entry read (the in-memory table
@@ -452,6 +466,9 @@ function readTypedAdapter(adapterPtr) {
     };
     RESET_FIELDS.forEach(f => header[f] = num(t[f]));
     HEADER_TAIL_FIELDS.forEach(f => header[f] = num(t[f]));
+    if (version >= OWNERSHIP_VERSION) {
+        OWNERSHIP_FIELDS.forEach(f => header[f] = num(t[f]));
+    }
     const queueCount = Math.min(num(t.QueueCount), MAX_CPU);
     const queues = [];
     for (let i = 0; i < queueCount; i++) {
@@ -549,6 +566,10 @@ function readRawHeader(address, source, strict) {
     const fields = RESET_FIELDS.concat(HEADER_TAIL_FIELDS);
     const values = readValues(address.add(HEADER_ULONGS * 4), fields.length, 8);
     fields.forEach((f, i) => header[f] = num(values[i]));
+    if (version >= OWNERSHIP_VERSION && headerSize >= OWNERSHIP_HEADER_SIZE) {
+        const ownership = readValues(address.add(HEADER_SIZE), OWNERSHIP_FIELDS.length, 8);
+        OWNERSHIP_FIELDS.forEach((f, i) => header[f] = num(ownership[i]));
+    }
     return header;
 }
 
@@ -996,6 +1017,24 @@ function printTargets(a, showAll) {
     }
 }
 
+// Telemetry version 6 counters. The ownership lines are shown even when zero: a broken virtqueue
+// with nothing completed early rules that explanation out. !vioscsi_events has the occurrences.
+function printOwnership(a) {
+    if (a.EarlyCompletedCount === undefined) {
+        return;
+    }
+    log("Descriptor ownership: completed while the device held them " + a.EarlyCompletedCount +
+        "; extension reused while still referenced " + a.ExtReusedWhileOwnedCount);
+    log("Returned by the device but on no request list: " + a.OrphanReturnCount + " (never completed early " +
+        a.OrphanUnexplainedCount + ", into a reused extension " + a.OrphanIntoReusedExtCount +
+        "; forgotten, table full " + a.ZombieEvictedCount + ")");
+    if (a.SgZeroLengthCount || a.SgTooManyElementsCount || a.SgLengthMismatchCount || a.ZeroLengthDescCount) {
+        log("Scatter/gather: refused zero-length element " + a.SgZeroLengthCount + ", too many elements " +
+            a.SgTooManyElementsCount + "; length mismatch " + a.SgLengthMismatchCount +
+            "; zero-length descriptor published " + a.ZeroLengthDescCount);
+    }
+}
+
 function printAdapters(adapters, all, emptyMessage) {
     const showAll = all !== undefined && !isZero(all);
     if (adapters.length === 0) {
@@ -1015,6 +1054,7 @@ function printAdapters(adapters, all, emptyMessage) {
         if (a.OutOfRangeTargetCount) {
             log("Requests refused for a target ID beyond the device's maximum: " + a.OutOfRangeTargetCount);
         }
+        printOwnership(a);
         log("");
         const rows = a.Queues.filter(q => showAll || q.Completions || q.QueueFull || q.InFlight);
         rows.push(a.Total);
