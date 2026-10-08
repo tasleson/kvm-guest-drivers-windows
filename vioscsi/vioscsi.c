@@ -65,6 +65,8 @@ VIOSCSI_TELEMETRY_DIRECTORY VioScsiTelemetryDirectory =
     FIELD_OFFSET(ADAPTER_EXTENSION, Telemetry), // TelemetryOffset
     0,                                          // Reserved
     { NULL },                                   // Adapters
+    FIELD_OFFSET(ADAPTER_EXTENSION, EventRing), // EventRingOffset
+    0,                                          // Reserved2
 };
 // clang-format on
 
@@ -387,6 +389,7 @@ VioScsiFindAdapter(IN PVOID DeviceExtension,
     {
         adaptExt->Telemetry.Targets[index].TargetId = index;
     }
+    VioScsiEventRingInit(adaptExt);
     ConfigInfo->Master = TRUE;
     ConfigInfo->ScatterGather = TRUE;
     ConfigInfo->DmaWidth = Width32Bits;
@@ -1120,6 +1123,17 @@ static VOID ProcessTMFCompletion(IN PVOID DeviceExtension)
                 NT_ASSERT(0);
                 break;
         }
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventTmfComplete,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           cmd->req.tmf.lun[1],
+                           cmd->req.tmf.lun[3],
+                           0,
+                           NULL,
+                           Srb,
+                           0,
+                           resp->response,
+                           0);
         reaped = TRUE;
     }
 
@@ -1133,6 +1147,17 @@ static VOID ProcessTMFCompletion(IN PVOID DeviceExtension)
     if (reaped)
     {
         StorPortResume(DeviceExtension);
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventResume,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           0,
+                           0,
+                           0,
+                           NULL,
+                           NULL,
+                           0,
+                           0,
+                           VIOSCSI_SITE_TMF_COMPLETION);
         InterlockedExchange(&adaptExt->tmf_infly, FALSE);
     }
 }
@@ -1425,6 +1450,12 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
                         if (SRB_PATH_ID(currSrb) == stor_addr->Path && SRB_TARGET_ID(currSrb) == stor_addr->Target &&
                             SRB_LUN(currSrb) == stor_addr->Lun)
                         {
+                            VioScsiRecordSrbEvent(adaptExt,
+                                                  VioScsiEventEarlyComplete,
+                                                  currSrbExt,
+                                                  VIOSCSI_EARLY_SURPRISE_REMOVAL,
+                                                  currSrbExt->SubmitTime ? StorPerfInterruptTime(adaptExt) - currSrbExt->SubmitTime
+                                                                         : 0);
                             SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_NO_DEVICE);
                             SRB_SET_DATA_TRANSFER_LENGTH(currSrb, 0);
                             currSrbExt->SubmitTime = 0; // not a device completion, keep it out of latency stats
@@ -1690,10 +1721,26 @@ VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr)
             if (!bFound)
             {
                 RhelDbgPrint(TRACE_LEVEL_WARNING, " No SRB found for ID 0x%p\n", (void *)srbId);
+                VioScsiRecordEvent(adaptExt,
+                                   VioScsiEventOrphanReturn,
+                                   index - VIRTIO_SCSI_REQUEST_QUEUE_0,
+                                   0,
+                                   0,
+                                   srbId,
+                                   NULL,
+                                   NULL,
+                                   0,
+                                   len,
+                                   0);
             }
 
             if (bFound)
             {
+                VioScsiRecordSrbEvent(adaptExt,
+                                      VioScsiEventDeviceComplete,
+                                      srbExt,
+                                      len,
+                                      srbExt->cmd.resp.cmd.response | ((ULONG64)srbExt->cmd.resp.cmd.status << 8));
                 HandleResponse(DeviceExtension, &srbExt->cmd);
             }
         }
@@ -1719,6 +1766,7 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension, IN UCHAR TargetId,
     PADAPTER_EXTENSION adaptExt;
     ULONG QueueNum;
     ULONG MsgId;
+    ULONG64 earlyCount = 0;
 
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
@@ -1726,6 +1774,17 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension, IN UCHAR TargetId,
     {
         adaptExt->reset_in_progress = TRUE;
         StorPortPause(DeviceExtension, 10);
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventPause,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           TargetId,
+                           Lun,
+                           0,
+                           NULL,
+                           NULL,
+                           0,
+                           10,
+                           VIOSCSI_SITE_COMPLETE_PENDING_RESET);
         DeviceReset(DeviceExtension, TargetId, Lun);
 
         for (ULONG index = 0; index < adaptExt->num_queues; index++)
@@ -1744,6 +1803,15 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension, IN UCHAR TargetId,
                     PSRB_EXTENSION currSrbExt = CONTAINING_RECORD(entry, SRB_EXTENSION, list_entry);
                     PSCSI_REQUEST_BLOCK currSrb = currSrbExt->Srb;
                     StorPerfTargetRemoved(&adaptExt->Telemetry, currSrbExt);
+                    // Still on a request list, so the device hasn't returned it: it may yet read the
+                    // descriptors and write the response of a request Storport now considers done.
+                    VioScsiRecordSrbEvent(adaptExt,
+                                          VioScsiEventEarlyComplete,
+                                          currSrbExt,
+                                          VIOSCSI_EARLY_RESET,
+                                          currSrbExt->SubmitTime ? StorPerfInterruptTime(adaptExt) - currSrbExt->SubmitTime
+                                                                 : 0);
+                    earlyCount++;
                     if (currSrb)
                     {
                         SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_BUS_RESET);
@@ -1762,6 +1830,28 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension, IN UCHAR TargetId,
             VioScsiVQUnlock(DeviceExtension, MsgId, &LockHandle, FALSE);
         }
         StorPortResume(DeviceExtension);
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventResume,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           TargetId,
+                           Lun,
+                           0,
+                           NULL,
+                           NULL,
+                           0,
+                           0,
+                           VIOSCSI_SITE_COMPLETE_PENDING_RESET);
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventResetDone,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           TargetId,
+                           Lun,
+                           0,
+                           NULL,
+                           NULL,
+                           0,
+                           earlyCount,
+                           0);
     }
     else
     {
@@ -1880,6 +1970,17 @@ PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
             }
             InterlockedExchange64((PLONG64)&adaptExt->Telemetry.LastResetTime,
                                   (LONG64)StorPerfInterruptTime(adaptExt));
+            VioScsiRecordEvent(adaptExt,
+                               VioScsiEventResetRequest,
+                               VIOSCSI_EVENT_NO_QUEUE,
+                               SRB_TARGET_ID(Srb),
+                               SRB_LUN(Srb),
+                               0,
+                               NULL,
+                               Srb,
+                               0,
+                               SRB_FUNCTION(Srb),
+                               (ULONG64)(ULONG)adaptExt->action_on_reset);
 
             switch (adaptExt->action_on_reset)
             {

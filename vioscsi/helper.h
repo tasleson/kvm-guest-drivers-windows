@@ -147,6 +147,26 @@ VOID CompleteRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
 
 VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
 
+VOID VioScsiEventRingInit(IN PADAPTER_EXTENSION adaptExt);
+
+VOID VioScsiRecordEvent(IN PADAPTER_EXTENSION adaptExt,
+                        IN VIOSCSI_EVENT_CODE Code,
+                        IN ULONG Queue,
+                        IN UCHAR Target,
+                        IN UCHAR Lun,
+                        IN ULONG_PTR Id,
+                        IN PVOID SrbExt,
+                        IN PVOID Srb,
+                        IN ULONG64 TablePa,
+                        IN ULONG64 Value1,
+                        IN ULONG64 Value2);
+
+VOID VioScsiRecordSrbEvent(IN PADAPTER_EXTENSION adaptExt,
+                           IN VIOSCSI_EVENT_CODE Code,
+                           IN PSRB_EXTENSION SrbExt,
+                           IN ULONG64 Value1,
+                           IN ULONG64 Value2);
+
 extern VirtIOSystemOps VioScsiSystemOps;
 
 #endif ___HELPER_H___

@@ -265,6 +265,7 @@ typedef struct _SRB_EXTENSION
     ULONG QueueIndex;     // index into ADAPTER_EXTENSION.processing_srbs / Telemetry.Queues, set by SendSRB
     ULONGLONG SubmitTime; // StorPerfInterruptTime() when queued, 0 if never submitted; feeds OldestInFlightTime
     ULONG TargetId;       // SRB_TARGET_ID, set by VioScsiBuildIo; indexes Telemetry.Targets (bounds-checked there)
+    ULONG64 TablePa;      // physical address of desc_alias as published by SendSRB, 0 if not sent indirect
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
 
@@ -613,6 +614,95 @@ StorPerfTargetActive(IN PTARGET_TELEMETRY Target)
             Target->DeviceResetCount | Target->LogicalUnitResetCount) != 0;
 }
 
+//
+// Per-adapter event ring: the last VIOSCSI_EVENT_RING_SIZE things that happened to requests and
+// resets on this adapter, kept in the adapter extension so a kernel dump taken the moment the
+// device breaks shows the sequence that led up to it. Every request is recorded when it is put on
+// a virtqueue and when the device returns it, so TablePa (the indirect descriptor table the device
+// reads, the "desc addr" QEMU prints for a bad descriptor chain) can be traced back to the request
+// that owned it and to what the driver did with that request afterwards.
+//
+// Recording is lock-free: a writer claims a slot by incrementing Next and writes Sequence last, so
+// an entry whose Sequence is 0 or doesn't match its slot was being overwritten when the dump was
+// taken. Entries are ordered by Sequence, not by slot. Fields are fixed-width so the layout is the
+// same on every architecture; the event codes below say what Id, Value1 and Value2 hold. Not
+// recorded in dump mode.
+//
+#define VIOSCSI_EVENT_RING_MAGIC   0x47525645 // 'EVRG' in memory byte order
+#define VIOSCSI_EVENT_RING_VERSION 1
+#define VIOSCSI_EVENT_RING_SIZE    8192 // a power of two
+#define VIOSCSI_EVENT_NO_QUEUE     0xFFFF
+
+typedef enum _VIOSCSI_EVENT_CODE
+{
+    // SendSRB put a request on a virtqueue. Value1: out | in << 16, Value2: data bytes.
+    VioScsiEventPublish = 1,
+    // The device returned a request that was on a request list. Value1: used length, Value2: virtio
+    // response | SCSI status << 8.
+    VioScsiEventDeviceComplete = 2,
+    // The device returned a cookie (Id) that no request list holds. Value1: used length.
+    VioScsiEventOrphanReturn = 3,
+    // A request was completed to Storport without the device returning it, so the device may still
+    // read its descriptors and write its response. Value1: VIOSCSI_EARLY_*, Value2: 100 ns since it
+    // was published.
+    VioScsiEventEarlyComplete = 4,
+    // A reset SRB arrived. Value1: SRB function, Value2: action_on_reset.
+    VioScsiEventResetRequest = 5,
+    // CompletePendingRequestsOnReset finished. Value1: requests it completed early.
+    VioScsiEventResetDone = 6,
+    // DeviceReset posted a TMF to Target/Lun. Value1: TMF subtype.
+    VioScsiEventTmfSent = 7,
+    // DeviceReset folded a reset of Target/Lun into the TMF already in flight.
+    VioScsiEventTmfCoalesced = 8,
+    // ProcessTMFCompletion reaped the TMF. Value1: virtio response.
+    VioScsiEventTmfComplete = 9,
+    // StorPortPause. Value1: timeout in seconds, Value2: VIOSCSI_SITE_*.
+    VioScsiEventPause = 10,
+    // StorPortResume. Value2: VIOSCSI_SITE_*.
+    VioScsiEventResume = 11,
+} VIOSCSI_EVENT_CODE;
+
+// VioScsiEventEarlyComplete Value1: why the request was completed early.
+#define VIOSCSI_EARLY_RESET                 1 // CompletePendingRequestsOnReset
+#define VIOSCSI_EARLY_SURPRISE_REMOVAL      2 // ScsiUnitSurpriseRemoval
+
+// VioScsiEventPause/Resume Value2: which code paused or resumed the adapter.
+#define VIOSCSI_SITE_COMPLETE_PENDING_RESET 1 // CompletePendingRequestsOnReset
+#define VIOSCSI_SITE_DEVICE_RESET           2 // DeviceReset, until the TMF is reaped
+#define VIOSCSI_SITE_TMF_COMPLETION         3 // ProcessTMFCompletion
+#define VIOSCSI_SITE_TMF_SEND_FAILED        4 // DeviceReset, TMF could not be posted
+
+typedef struct _VIOSCSI_EVENT
+{
+    ULONG64 Sequence; // 1-based position in this adapter's event stream, written last; 0 = empty
+    ULONG64 Time;     // StorPerfInterruptTime() when recorded
+    ULONG64 TablePa;  // the request's indirect descriptor table (SRB_EXTENSION.TablePa), 0 if none
+    ULONG64 Id;       // virtqueue cookie (SRB_EXTENSION.id), 0 if none
+    ULONG64 SrbExt;   // SRB extension address, 0 if none
+    ULONG64 Srb;      // SRB address, 0 if none
+    ULONG64 Value1;   // see VIOSCSI_EVENT_CODE
+    ULONG64 Value2;
+    USHORT Code;  // VIOSCSI_EVENT_CODE
+    USHORT Queue; // request queue index (processing_srbs/Telemetry.Queues), VIOSCSI_EVENT_NO_QUEUE if none
+    UCHAR Target;
+    UCHAR Lun;
+    USHORT Reserved;
+} VIOSCSI_EVENT, *PVIOSCSI_EVENT;
+
+typedef struct _VIOSCSI_EVENT_RING
+{
+    ULONG Magic;          // VIOSCSI_EVENT_RING_MAGIC once initialized
+    ULONG Version;        // VIOSCSI_EVENT_RING_VERSION
+    ULONG EntrySize;      // sizeof(VIOSCSI_EVENT)
+    ULONG EntryCount;     // VIOSCSI_EVENT_RING_SIZE
+    volatile LONG64 Next; // events recorded so far; event N (1-based) is in Entries[(N - 1) % EntryCount]
+    VIOSCSI_EVENT Entries[VIOSCSI_EVENT_RING_SIZE];
+} VIOSCSI_EVENT_RING, *PVIOSCSI_EVENT_RING;
+
+C_ASSERT((VIOSCSI_EVENT_RING_SIZE & (VIOSCSI_EVENT_RING_SIZE - 1)) == 0);
+C_ASSERT(sizeof(VIOSCSI_EVENT) == 72);
+C_ASSERT(FIELD_OFFSET(VIOSCSI_EVENT_RING, Entries) == 24);
+
 typedef struct virtio_bar
 {
     PHYSICAL_ADDRESS BasePA;
@@ -691,6 +781,7 @@ typedef struct _ADAPTER_EXTENSION
     ULONG resp_time;
     BOOLEAN bRemoved;
     STOR_TELEMETRY Telemetry;
+    VIOSCSI_EVENT_RING EventRing;
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
 
 // Current time for telemetry timestamps (see the STOR_TELEMETRY timestamp notes). Returns 0
@@ -712,10 +803,11 @@ StorPerfInterruptTime(IN PADAPTER_EXTENSION adaptExt)
 // and TelemetryOffset to reach each adapter's STOR_TELEMETRY. The magic is written only by
 // the directory's static initializer, never by code, so the directory is the only place it
 // appears in the image. Same versioning rules as STOR_TELEMETRY: append fields only, bump
-// Version.
+// Version. Version 2 appended EventRingOffset, after Adapters[] so that a version 1 reader,
+// which only knows the fields before it, still parses the directory.
 //
 #define VIOSCSI_TELEMETRY_DIRECTORY_MAGIC   0x44545356 // 'VSTD' in memory byte order
-#define VIOSCSI_TELEMETRY_DIRECTORY_VERSION 1
+#define VIOSCSI_TELEMETRY_DIRECTORY_VERSION 2
 
 typedef struct _VIOSCSI_TELEMETRY_DIRECTORY
 {
@@ -726,11 +818,14 @@ typedef struct _VIOSCSI_TELEMETRY_DIRECTORY
     ULONG TelemetryOffset; // FIELD_OFFSET(ADAPTER_EXTENSION, Telemetry)
     ULONG Reserved;
     PADAPTER_EXTENSION Adapters[VIOSCSI_MAX_TELEMETRY_ADAPTERS];
+    ULONG EventRingOffset; // FIELD_OFFSET(ADAPTER_EXTENSION, EventRing) (version 2)
+    ULONG Reserved2;
 } VIOSCSI_TELEMETRY_DIRECTORY, *PVIOSCSI_TELEMETRY_DIRECTORY;
 
 C_ASSERT(FIELD_OFFSET(VIOSCSI_TELEMETRY_DIRECTORY, Adapters) == 6 * sizeof(ULONG));
 C_ASSERT(FIELD_OFFSET(VIOSCSI_TELEMETRY_DIRECTORY, Adapters) % sizeof(PVOID) == 0);
 C_ASSERT(FIELD_OFFSET(ADAPTER_EXTENSION, Telemetry) % sizeof(ULONG64) == 0);
+C_ASSERT(FIELD_OFFSET(ADAPTER_EXTENSION, EventRing) % sizeof(ULONG64) == 0);
 
 #ifndef PCIX_TABLE_POINTER
 typedef struct

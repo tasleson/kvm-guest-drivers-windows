@@ -153,6 +153,7 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     element->next_id = ++id;
 
     SET_VA_PA();
+    srbExt->TablePa = pa;
     add_buffer_req_status = virtqueue_add_buf(adaptExt->vq[QueueNumber],
                                               srbExt->psgl,
                                               srbExt->out,
@@ -177,6 +178,11 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         {
             queueStats->InFlightHighWaterMark = element->srb_cnt;
         }
+        VioScsiRecordSrbEvent(adaptExt,
+                              VioScsiEventPublish,
+                              srbExt,
+                              srbExt->out | ((ULONG64)srbExt->in << 16),
+                              srbExt->Xfer);
     }
     else
     {
@@ -273,6 +279,17 @@ DeviceReset(IN PVOID DeviceExtension, IN UCHAR TargetId, IN UCHAR Lun)
     if (InterlockedCompareExchange(&adaptExt->tmf_infly, TRUE, FALSE) != FALSE)
     {
         InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.DeviceResetTmfInFlightCount);
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventTmfCoalesced,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           TargetId,
+                           Lun,
+                           0,
+                           NULL,
+                           NULL,
+                           0,
+                           0,
+                           0);
         RhelDbgPrint(TRACE_LEVEL_WARNING,
                      " TMF already in flight, coalescing reset of target %d LUN %d into it.\n",
                      TargetId,
@@ -304,6 +321,30 @@ DeviceReset(IN PVOID DeviceExtension, IN UCHAR TargetId, IN UCHAR Lun)
     sgElement++;
     srbExt->in = sgElement - srbExt->out;
     StorPortPause(DeviceExtension, 60);
+    VioScsiRecordEvent(adaptExt,
+                       VioScsiEventPause,
+                       VIOSCSI_EVENT_NO_QUEUE,
+                       TargetId,
+                       Lun,
+                       0,
+                       NULL,
+                       NULL,
+                       0,
+                       60,
+                       VIOSCSI_SITE_DEVICE_RESET);
+    // Recorded before posting: once posted, the TMF can complete (and be recorded) on another CPU
+    // before SendTMF returns here.
+    VioScsiRecordEvent(adaptExt,
+                       VioScsiEventTmfSent,
+                       VIOSCSI_EVENT_NO_QUEUE,
+                       TargetId,
+                       Lun,
+                       0,
+                       NULL,
+                       NULL,
+                       0,
+                       VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET,
+                       0);
     if (!SendTMF(DeviceExtension, Srb))
     {
         // Resets folded into this one while it was being built have already returned TRUE.
@@ -311,6 +352,17 @@ DeviceReset(IN PVOID DeviceExtension, IN UCHAR TargetId, IN UCHAR Lun)
         // before releasing tmf_cmd, see ProcessTMFCompletion.
         RhelDbgPrint(TRACE_LEVEL_ERROR, " Failed to post TMF, coalesced resets were not sent.\n");
         StorPortResume(DeviceExtension);
+        VioScsiRecordEvent(adaptExt,
+                           VioScsiEventResume,
+                           VIOSCSI_EVENT_NO_QUEUE,
+                           TargetId,
+                           Lun,
+                           0,
+                           NULL,
+                           NULL,
+                           0,
+                           0,
+                           VIOSCSI_SITE_TMF_SEND_FAILED);
         InterlockedExchange(&adaptExt->tmf_infly, FALSE);
         return FALSE;
     }
@@ -846,4 +898,84 @@ VOID FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
             break;
     }
     EXIT_FN();
+}
+
+VOID VioScsiEventRingInit(IN PADAPTER_EXTENSION adaptExt)
+{
+    PVIOSCSI_EVENT_RING ring = &adaptExt->EventRing;
+
+    // The crash dump instance never records (StorPerfInterruptTime has no clock there), so leave
+    // its ring without a magic rather than show an empty one in a dump.
+    if (adaptExt->dump_mode)
+    {
+        return;
+    }
+    ring->Version = VIOSCSI_EVENT_RING_VERSION;
+    ring->EntrySize = (ULONG)sizeof(VIOSCSI_EVENT);
+    ring->EntryCount = VIOSCSI_EVENT_RING_SIZE;
+    ring->Next = 0;
+    ring->Magic = VIOSCSI_EVENT_RING_MAGIC;
+}
+
+VOID VioScsiRecordEvent(IN PADAPTER_EXTENSION adaptExt,
+                        IN VIOSCSI_EVENT_CODE Code,
+                        IN ULONG Queue,
+                        IN UCHAR Target,
+                        IN UCHAR Lun,
+                        IN ULONG_PTR Id,
+                        IN PVOID SrbExt,
+                        IN PVOID Srb,
+                        IN ULONG64 TablePa,
+                        IN ULONG64 Value1,
+                        IN ULONG64 Value2)
+{
+    PVIOSCSI_EVENT_RING ring = &adaptExt->EventRing;
+    PVIOSCSI_EVENT event;
+    LONG64 sequence;
+
+    if (ring->Magic != VIOSCSI_EVENT_RING_MAGIC)
+    {
+        return;
+    }
+    // Called from StartIo, the ISR, DPCs and BuildIo on any CPU with whatever locks they hold, so
+    // claim the slot atomically. Sequence goes last and is cleared first, so a reader can tell a
+    // slot that was being rewritten when the dump was taken.
+    sequence = InterlockedIncrement64(&ring->Next);
+    event = &ring->Entries[(ULONG)((ULONG64)(sequence - 1) & (VIOSCSI_EVENT_RING_SIZE - 1))];
+    event->Sequence = 0;
+    KeMemoryBarrier();
+    event->Time = StorPerfInterruptTime(adaptExt);
+    event->TablePa = TablePa;
+    event->Id = (ULONG64)Id;
+    event->SrbExt = (ULONG64)(ULONG_PTR)SrbExt;
+    event->Srb = (ULONG64)(ULONG_PTR)Srb;
+    event->Value1 = Value1;
+    event->Value2 = Value2;
+    event->Code = (USHORT)Code;
+    event->Queue = (USHORT)((Queue < VIOSCSI_EVENT_NO_QUEUE) ? Queue : VIOSCSI_EVENT_NO_QUEUE);
+    event->Target = Target;
+    event->Lun = Lun;
+    event->Reserved = 0;
+    KeMemoryBarrier();
+    event->Sequence = (ULONG64)sequence;
+}
+
+VOID VioScsiRecordSrbEvent(IN PADAPTER_EXTENSION adaptExt,
+                           IN VIOSCSI_EVENT_CODE Code,
+                           IN PSRB_EXTENSION SrbExt,
+                           IN ULONG64 Value1,
+                           IN ULONG64 Value2)
+{
+    // lun[3] is the LUN as VioScsiBuildIo addressed the command; TargetId is the SRB's target.
+    VioScsiRecordEvent(adaptExt,
+                       Code,
+                       SrbExt->QueueIndex,
+                       (UCHAR)SrbExt->TargetId,
+                       SrbExt->cmd.req.cmd.lun[3],
+                       SrbExt->id,
+                       SrbExt,
+                       SrbExt->Srb,
+                       SrbExt->TablePa,
+                       Value1,
+                       Value2);
 }
