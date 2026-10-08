@@ -1042,12 +1042,23 @@ VOID VioScsiZombieAdd(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt)
 {
     PVIOSCSI_ZOMBIE zombie;
     LONG64 evicted;
+    ULONG probe;
 
     if (adaptExt->dump_mode)
     {
         return;
     }
-    zombie = &adaptExt->Zombies[(ULONG)InterlockedIncrement(&adaptExt->ZombieNext) & (VIOSCSI_ZOMBIE_SLOTS - 1)];
+    // Skip slots still in use, so an entry is only evicted when the table is (nearly) full. The
+    // entries most worth keeping are the requests the device holds longest, and taking the next
+    // slot regardless would evict them after VIOSCSI_ZOMBIE_SLOTS more early completions, however
+    // many of those the device had already returned. If none of the slots probed is free, the
+    // last one is evicted. Each probe takes its own counter value, so two callers can only land
+    // on the same slot if the counter wraps the table while one of them is still filling it.
+    probe = 0;
+    do
+    {
+        zombie = &adaptExt->Zombies[(ULONG)InterlockedIncrement(&adaptExt->ZombieNext) & (VIOSCSI_ZOMBIE_SLOTS - 1)];
+    } while (zombie->Key != 0 && ++probe < VIOSCSI_ZOMBIE_PROBES);
     // Clear the key before touching the other fields, so a concurrent VioScsiZombieTake can't
     // match the old request and read this one's fields.
     evicted = InterlockedExchange64(&zombie->Key, 0);

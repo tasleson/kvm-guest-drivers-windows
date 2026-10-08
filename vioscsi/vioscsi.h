@@ -763,11 +763,13 @@ typedef struct _VIOSCSI_EVENT_RING
 // request list holds belonged to. SrbExt is only ever compared, never dereferenced: Storport may
 // have freed or reused that memory.
 //
-// Slots are claimed round-robin with interlocked operations; a full table overwrites the oldest
-// slot (counted in ZombieEvictedCount). Key is cleared before a slot is refilled and written last,
-// so a reader that matched it can claim the slot with a compare-exchange.
+// Slots are claimed round-robin with interlocked operations, skipping occupied ones; when none of
+// the next VIOSCSI_ZOMBIE_PROBES is free, the table is all but full and the last of them is
+// overwritten (counted in ZombieEvictedCount). Key is cleared before a slot is refilled and
+// written last, so a reader that matched it can claim the slot with a compare-exchange.
 //
-#define VIOSCSI_ZOMBIE_SLOTS 1024 // a power of two
+#define VIOSCSI_ZOMBIE_SLOTS  1024 // a power of two
+#define VIOSCSI_ZOMBIE_PROBES 64
 
 typedef struct _VIOSCSI_ZOMBIE
 {
@@ -783,6 +785,7 @@ typedef struct _VIOSCSI_ZOMBIE
 
 C_ASSERT((VIOSCSI_ZOMBIE_SLOTS & (VIOSCSI_ZOMBIE_SLOTS - 1)) == 0);
 C_ASSERT(sizeof(VIOSCSI_ZOMBIE) == 56);
+C_ASSERT(VIOSCSI_ZOMBIE_PROBES >= 1 && VIOSCSI_ZOMBIE_PROBES <= VIOSCSI_ZOMBIE_SLOTS);
 
 C_ASSERT((VIOSCSI_EVENT_RING_SIZE & (VIOSCSI_EVENT_RING_SIZE - 1)) == 0);
 C_ASSERT(sizeof(VIOSCSI_EVENT) == 72);
