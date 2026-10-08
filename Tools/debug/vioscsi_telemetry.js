@@ -11,6 +11,11 @@
 //   dx @$vioscsiTelemetry()                the same data as data model objects
 //   dx -r3 @$vioscsiTelemetry()[0].Queues  drill into per-queue values and raw histograms
 //   dx @$vioscsiTelemetry()[0].Targets     per-SCSI-target values (active targets only)
+//   !vioscsi_events [adapter] [table PA] [count]
+//                                          the adapter's event ring: the last <count> events
+//                                          (default 64), or with a table PA every event of the
+//                                          request(s) whose indirect descriptor table is there
+//   dx @$vioscsiEvents([adapter])          the decoded event rings and outstanding zombies
 //
 // With matching vioscsi symbols, !vioscsi_telemetry reads vioscsi!VioScsiTelemetryDirectory
 // and the typed structures. Without them it finds the vioscsi image in the module list, scans
@@ -112,6 +117,33 @@ const RAW_MAX_TARGETS_OFFSET = 16 * 1024 * 1024;
 const DIRECTORY_ULONGS = 6;
 const DIRECTORY_MAX_ADAPTERS = 64;
 const DIRECTORY_MAX_TELEMETRY_OFFSET = 4 * 1024 * 1024;
+// VIOSCSI_TELEMETRY_DIRECTORY version 2 appends EventRingOffset and ZombiesOffset (2 ULONGs)
+// after Adapters[].
+const DIRECTORY_EVENTS_VERSION = 2;
+const DIRECTORY_MAX_EXTENSION_OFFSET = 16 * 1024 * 1024;
+// VIOSCSI_EVENT_RING: Magic, Version, EntrySize, EntryCount (ULONGs), Next (ULONG64), then
+// Entries[EntryCount]. VIOSCSI_EVENT: Sequence, Time, TablePa, Id, SrbExt, Srb, Value1, Value2
+// (ULONG64s), then Code, Queue (USHORTs), Target, Lun (UCHARs) and a USHORT of padding.
+const VIOSCSI_EVENT_RING_MAGIC = 0x47525645; // 'EVRG'
+const EVENT_RING_HEADER_SIZE = 24;
+const EVENT_SLOTS = 9;
+const EVENT_RING_MAX_ENTRIES = 1 << 20;
+const EVENT_NO_QUEUE = 0xFFFF;
+const EVENTS_DEFAULT_COUNT = 64;
+// VIOSCSI_ZOMBIE[VIOSCSI_ZOMBIE_SLOTS]: Key, Id, SrbExt, Srb, TablePa, Time (ULONG64s), then
+// Reused and Queue (ULONGs).
+const VIOSCSI_ZOMBIE_SLOTS = 1024;
+const ZOMBIE_SLOTS = 7;
+const EVENT_NAMES = {
+    1: "Publish", 2: "DeviceComplete", 3: "OrphanReturn", 4: "EarlyComplete", 5: "ResetRequest",
+    6: "ResetDone", 7: "TmfSent", 8: "TmfCoalesced", 9: "TmfComplete", 10: "Pause", 11: "Resume",
+    12: "ExtReused", 13: "SgZeroLength", 14: "SgTooManyElements", 15: "SgLengthMismatch",
+    16: "ZeroLengthDesc"
+};
+const EVENT_SITE_NAMES = {
+    1: "CompletePendingRequestsOnReset", 2: "DeviceReset", 3: "ProcessTMFCompletion",
+    4: "DeviceReset, TMF not posted"
+};
 const IMAGE_SCN_MEM_WRITE = 0x80000000;
 const PAGE_SIZE = 4096;
 const SCAN_WARN_BYTES = 256 * 1024 * 1024;
@@ -735,7 +767,22 @@ function readDirectoryAt(address) {
         const adapters = readValues(address.add(DIRECTORY_ULONGS * 4), maxAdapters, pointerSize)
             .filter(p => !isZero(p))
             .map(toAddress);
-        return { Address: address, TelemetryOffset: telemetryOffset, Adapters: adapters };
+        // 0 when the driver predates the event ring.
+        let eventRingOffset = 0;
+        let zombiesOffset = 0;
+        if (version >= DIRECTORY_EVENTS_VERSION) {
+            [eventRingOffset, zombiesOffset] =
+                readValues(address.add(DIRECTORY_ULONGS * 4 + maxAdapters * pointerSize), 2, 4).map(low32);
+            if (eventRingOffset % 8 !== 0 || eventRingOffset >= DIRECTORY_MAX_EXTENSION_OFFSET ||
+                zombiesOffset % 8 !== 0 || zombiesOffset >= DIRECTORY_MAX_EXTENSION_OFFSET) {
+                eventRingOffset = 0;
+                zombiesOffset = 0;
+            }
+        }
+        return {
+            Address: address, TelemetryOffset: telemetryOffset, Adapters: adapters,
+            EventRingOffset: eventRingOffset, ZombiesOffset: zombiesOffset
+        };
     } catch (e) {
         return null;
     }
@@ -925,7 +972,10 @@ function pad(s, width, left) {
 function fmtTable(columns, rows) {
     const cells = rows.map(r => columns.map(c => String(c.value(r))));
     const widths = columns.map((c, i) => Math.max(c.name.length, ...cells.map(r => r[i].length)));
-    const line = vals => vals.map((v, i) => pad(v, widths[i], i === 0)).join("  ");
+    // The first column and any marked left (free text) are left-aligned, numbers right-aligned.
+    const line = vals => vals.map((v, i) => pad(v, widths[i], i === 0 || columns[i].left === true))
+                             .join("  ")
+                             .replace(/\s+$/, "");
     log(line(columns.map(c => c.name)));
     log(line(widths.map(w => "-".repeat(w))));
     cells.forEach(r => log(line(r)));
@@ -1113,12 +1163,272 @@ function printTelemetryScan(start, length, all) {
     });
 }
 
+// ---- Event ring ----
+
+// The directory, read raw even when symbols are available: only the offsets and adapter
+// addresses are needed, and the raw layout is the same either way.
+function eventDirectory() {
+    try {
+        const d = readDirectoryAt(host.getModuleSymbolAddress(MODULE, DIRECTORY_SYMBOL));
+        if (d) {
+            return d;
+        }
+    } catch (e) {
+        // No symbols: fall back to scanning the image.
+    }
+    return scanDirectory();
+}
+
+// Decodes one VIOSCSI_EVENT from its ULONG64 slots (v[base] .. v[base + EVENT_SLOTS - 1]).
+function decodeEvent(v, base) {
+    const tail = v[base + 8];
+    const lo = low32(tail);
+    const hi = high32(tail);
+    return {
+        Sequence: num(v[base]),
+        Time: num(v[base + 1]),
+        TablePa: v[base + 2],
+        Id: v[base + 3],
+        SrbExt: v[base + 4],
+        Srb: v[base + 5],
+        Value1: v[base + 6],
+        Value2: v[base + 7],
+        Code: lo & 0xFFFF,
+        Queue: lo >>> 16,
+        Target: hi & 0xFF,
+        Lun: (hi >>> 8) & 0xFF
+    };
+}
+
+// Reads a VIOSCSI_EVENT_RING; events come back oldest first. An entry is kept only if its
+// Sequence belongs in its slot: 0 is an unused slot, and a mismatch a slot being rewritten when
+// the dump was taken.
+function readEventRing(ring) {
+    const [magic, version, entrySize, entryCount] = readValues(ring, 4, 4).map(low32);
+    if (magic !== VIOSCSI_EVENT_RING_MAGIC) {
+        throw new Error("no event ring at " + hex(ring) + " (crash dump instance, or a driver without one)");
+    }
+    if (entrySize < EVENT_SLOTS * 8 || entrySize % 8 !== 0 || entryCount < 1 ||
+        entryCount > EVENT_RING_MAX_ENTRIES || (entryCount & (entryCount - 1)) !== 0) {
+        throw new Error("implausible event ring at " + hex(ring) + ": EntrySize " + entrySize +
+                        ", EntryCount " + entryCount);
+    }
+    const next = num(readValues(ring.add(16), 1, 8)[0]);
+    const slots = entrySize / 8;
+    const v = readValues(ring.add(EVENT_RING_HEADER_SIZE), entryCount * slots, 8);
+    const events = [];
+    for (let i = 0; i < entryCount; i++) {
+        const e = decodeEvent(v, i * slots);
+        if (e.Sequence !== 0 && (e.Sequence - 1) % entryCount === i) {
+            events.push(e);
+        }
+    }
+    events.sort((a, b) => a.Sequence - b.Sequence);
+    return { Address: ring, Version: version, Recorded: next, EntryCount: entryCount, Events: events };
+}
+
+// Live entries of an adapter's Zombies[]: requests completed early that the device hasn't
+// returned yet.
+function readZombies(address) {
+    const v = readValues(address, VIOSCSI_ZOMBIE_SLOTS * ZOMBIE_SLOTS, 8);
+    const zombies = [];
+    for (let i = 0; i < VIOSCSI_ZOMBIE_SLOTS; i++) {
+        const b = i * ZOMBIE_SLOTS;
+        if (isZero(v[b])) {
+            continue;
+        }
+        zombies.push({
+            Slot: i, Id: v[b + 1], SrbExt: v[b + 2], Srb: v[b + 3], TablePa: v[b + 4], Time: num(v[b + 5]),
+            Reused: low32(v[b + 6]) !== 0, Queue: high32(v[b + 6])
+        });
+    }
+    return zombies;
+}
+
+function readAdapterEvents(adapter, directory) {
+    if (!directory.EventRingOffset) {
+        throw new Error("the telemetry directory has no event ring offset (driver predates the event ring)");
+    }
+    const result = readEventRing(adapter.add(directory.EventRingOffset));
+    result.Adapter = adapter;
+    result.Zombies = directory.ZombiesOffset ? readZombies(adapter.add(directory.ZombiesOffset)) : [];
+    return result;
+}
+
+// dx @$vioscsiEvents([adapter extension address])
+function vioscsiEvents(address) {
+    const directory = eventDirectory();
+    const adapters = (address !== undefined && !isZero(address)) ? [toAddress(address)] : directory.Adapters;
+    const result = [];
+    for (const a of adapters) {
+        try {
+            result.push(readAdapterEvents(a, directory));
+        } catch (e) {
+            log("warning: adapter " + hex(a) + ": " + e.message);
+        }
+    }
+    return result;
+}
+
+function sameAddress(a, b) {
+    return hex(a).toLowerCase() === hex(b).toLowerCase();
+}
+
+function hnsToUs(hns) {
+    return hns / HNS_PER_US;
+}
+
+function describeRequest(v2) {
+    return "DataTransferLength " + low32(v2) + ", SRB flags " + hex(high32(v2));
+}
+
+// What Value1/Value2 (and Id, for the scatter/gather events) mean for each code, see
+// VIOSCSI_EVENT_CODE in vioscsi/vioscsi.h.
+function describeEvent(e) {
+    const v1 = e.Value1;
+    const v2 = e.Value2;
+    switch (e.Code) {
+        case 1:
+            return "out " + (low32(v1) & 0xFFFF) + ", in " + ((low32(v1) >>> 16) & 0xFFFF) + ", " + num(v2) + " bytes";
+        case 2:
+            return "used length " + low32(v1) + ", response " + (low32(v2) & 0xFF) + ", SCSI status " +
+                   hex((low32(v2) >>> 8) & 0xFF);
+        case 3: {
+            const flags = high32(v1);
+            return "used length " + low32(v1) +
+                   ((flags & 1) ? ", completed early " + fmtUs(hnsToUs(num(v2))) + " before" :
+                                  ", NOT A REQUEST COMPLETED EARLY") +
+                   ((flags & 2) ? ", RETURNED INTO A REUSED EXTENSION" : "");
+        }
+        case 4:
+            return (num(v1) === 1 ? "by a reset" : num(v1) === 2 ? "by surprise removal" : "reason " + num(v1)) +
+                   ", the device had it for " + fmtUs(hnsToUs(num(v2)));
+        case 5:
+            return "SRB function " + hex(num(v1)) + ", action on reset " + hex(low32(v2));
+        case 6:
+            return num(v1) + " request(s) completed early";
+        case 7:
+            return "TMF subtype " + num(v1);
+        case 8:
+            return "folded into the TMF in flight";
+        case 9:
+            return "response " + num(v1);
+        case 10:
+            return "timeout " + num(v1) + "s, " + (EVENT_SITE_NAMES[num(v2)] || "site " + num(v2));
+        case 11:
+            return EVENT_SITE_NAMES[num(v2)] || "site " + num(v2);
+        case 12: {
+            const flags = num(v2);
+            return "DEVICE STILL HOLDS request " + hex(e.Id) + " completed early " + fmtUs(hnsToUs(num(v1))) +
+                   " before" + ((flags & 1) ? ", ownership mark still set" : "") +
+                   ((flags & 2) ? ", reused before" : "");
+        }
+        case 13:
+            return "REFUSED: element " + high32(v1) + " of " + low32(v1) + " has zero length; SRB function " +
+                   hex(num(e.Id)) + ", " + describeRequest(v2);
+        case 14:
+            return "REFUSED: " + high32(v1) + " elements, limit " + low32(v1) + "; SRB function " + hex(num(e.Id)) +
+                   ", " + describeRequest(v2);
+        case 15:
+            return "elements add up to " + num(v1) + "; SRB function " + hex(num(e.Id)) + ", " + describeRequest(v2);
+        case 16:
+            return "ZERO-LENGTH DESCRIPTOR " + high32(v1) + " of " + low32(v1) + ", address " + hex(v2);
+        default:
+            return "Value1 " + hex(v1) + ", Value2 " + hex(v2);
+    }
+}
+
+// Events of the request(s) whose indirect table is at tablePa: those recording that table, plus
+// those of the same SRB extensions (the table lives in the extension, so this also catches
+// events recorded before the table address was known, such as a refused scatter/gather list).
+function eventsForTable(events, tablePa) {
+    const exts = new Set();
+    for (const e of events) {
+        if (sameAddress(e.TablePa, tablePa) && !isZero(e.SrbExt)) {
+            exts.add(hex(e.SrbExt).toLowerCase());
+        }
+    }
+    return events.filter(e => sameAddress(e.TablePa, tablePa) ||
+                              (!isZero(e.SrbExt) && exts.has(hex(e.SrbExt).toLowerCase())));
+}
+
+const EVENT_COLUMNS = [
+    { name: "Seq", value: e => e.Sequence },
+    { name: "Age", value: e => e.AgeUs === null ? "-" : fmtUs(e.AgeUs) },
+    { name: "Event", value: e => EVENT_NAMES[e.Code] || "code " + e.Code },
+    { name: "Q", value: e => e.Queue === EVENT_NO_QUEUE ? "-" : e.Queue },
+    { name: "T:L", value: e => e.Target + ":" + e.Lun },
+    { name: "Id", value: e => isZero(e.Id) ? "-" : hex(e.Id) },
+    { name: "TablePa", value: e => isZero(e.TablePa) ? "-" : hex(e.TablePa) },
+    { name: "SrbExt", value: e => isZero(e.SrbExt) ? "-" : hex(e.SrbExt) },
+    { name: "Srb", value: e => isZero(e.Srb) ? "-" : hex(e.Srb) },
+    { name: "Detail", value: e => describeEvent(e), left: true }
+];
+
+const ZOMBIE_COLUMNS = [
+    { name: "Slot", value: z => z.Slot },
+    { name: "Q", value: z => z.Queue },
+    { name: "Id", value: z => hex(z.Id) },
+    { name: "TablePa", value: z => hex(z.TablePa) },
+    { name: "SrbExt", value: z => hex(z.SrbExt) },
+    { name: "Srb", value: z => hex(z.Srb) },
+    { name: "CompletedEarly", value: z => z.AgeUs === null ? "-" : fmtAgo(z.AgeUs) },
+    { name: "ExtReused", value: z => z.Reused ? "yes" : "no" }
+];
+
+function printEventRing(r, tablePa, count) {
+    // Ages are against the dump/session's interrupt time, or the newest event without one.
+    const newest = r.Events.length ? r.Events[r.Events.length - 1].Time : 0;
+    const now = readInterruptTimeHns() || newest;
+    r.Events.forEach(e => e.AgeUs = ageUs(now, e.Time));
+    r.Zombies.forEach(z => z.AgeUs = ageUs(now, z.Time));
+    log("");
+    log("== adapter " + hex(r.Adapter) + " event ring " + hex(r.Address) + ": " + r.Recorded +
+        " events recorded, the last " + r.Events.length + " kept; ages relative to " +
+        (readInterruptTimeHns() ? "the dump/session interrupt time" : "the newest event"));
+    let shown;
+    if (tablePa !== undefined && !isZero(tablePa)) {
+        shown = eventsForTable(r.Events, tablePa);
+        log("Events for the request(s) with table " + hex(tablePa) + ": " + shown.length);
+    } else {
+        shown = r.Events.slice(-count);
+        log("Last " + shown.length + " events:");
+    }
+    if (shown.length) {
+        fmtTable(EVENT_COLUMNS, shown);
+    }
+    let zombies = r.Zombies;
+    if (tablePa !== undefined && !isZero(tablePa)) {
+        zombies = zombies.filter(z => sameAddress(z.TablePa, tablePa));
+    }
+    log("");
+    log("Requests completed early that the device has not returned: " + zombies.length +
+        (zombies.length === r.Zombies.length ? "" : " (of " + r.Zombies.length + ")"));
+    if (zombies.length) {
+        fmtTable(ZOMBIE_COLUMNS, zombies);
+    }
+}
+
+// !vioscsi_events [adapter extension, 0 = all registered] [table PA, 0 = none] [count]
+function printEvents(address, tablePa, count) {
+    run(() => {
+        const n = (count === undefined || isZero(count)) ? EVENTS_DEFAULT_COUNT : num(count);
+        const rings = vioscsiEvents(address);
+        if (rings.length === 0) {
+            log("No vioscsi adapter with an event ring found");
+        }
+        rings.forEach(r => printEventRing(r, tablePa, n));
+    });
+}
+
 function initializeScript() {
     return [
         new host.apiVersionSupport(1, 7),
         new host.functionAlias(printTelemetry, "vioscsi_telemetry"),
         new host.functionAlias(printTelemetryAt, "vioscsi_telemetry_at"),
         new host.functionAlias(printTelemetryScan, "vioscsi_telemetry_scan"),
+        new host.functionAlias(printEvents, "vioscsi_events"),
+        new host.functionAlias(vioscsiEvents, "vioscsiEvents"),
         new host.functionAlias(vioscsiTelemetry, "vioscsiTelemetry"),
         new host.functionAlias(vioscsiTelemetryAt, "vioscsiTelemetryAt"),
         new host.functionAlias(vioscsiTelemetryScan, "vioscsiTelemetryScan")
