@@ -266,8 +266,17 @@ typedef struct _SRB_EXTENSION
     ULONGLONG SubmitTime; // StorPerfInterruptTime() when queued, 0 if never submitted; feeds OldestInFlightTime
     ULONG TargetId;       // SRB_TARGET_ID, set by VioScsiBuildIo; indexes Telemetry.Targets (bounds-checked there)
     ULONG64 TablePa;      // physical address of desc_alias as published by SendSRB, 0 if not sent indirect
+    // SendSRB sets OwnedMagic once the request is on a virtqueue and ProcessQueue clears it when the
+    // device returns the request, so in a dump an extension still carrying it was handed to the
+    // device at OwnedTime (with id, QueueIndex and TablePa) and not given back. Whether the device
+    // still references an extension VioScsiBuildIo is about to reuse is decided from
+    // ADAPTER_EXTENSION.Zombies instead: BuildIo zeroes these fields with the rest.
+    ULONG OwnedMagic;  // VIOSCSI_SRBEXT_OWNED_MAGIC while the device holds this request
+    ULONG64 OwnedTime; // StorPerfInterruptTime() when SendSRB published it
 } SRB_EXTENSION, *PSRB_EXTENSION;
 #pragma pack()
+
+#define VIOSCSI_SRBEXT_OWNED_MAGIC 0x444E574F // 'OWND' in memory byte order
 
 #pragma pack(1)
 typedef struct
@@ -332,7 +341,7 @@ typedef struct _REQUEST_LIST
 // The per-request latency counters keep using the Storport performance counter.
 //
 #define STOR_TELEMETRY_MAGIC              0x53505331 // 'SPS1'
-#define STOR_TELEMETRY_VERSION            5
+#define STOR_TELEMETRY_VERSION            6
 #define STOR_TELEMETRY_HISTOGRAM_BUCKETS  64
 #define STOR_TELEMETRY_STATUS_SLOTS       64
 
@@ -463,6 +472,15 @@ typedef struct _STOR_TELEMETRY
     ULONG64 OutOfRangeTargetCount;       // requests VioScsiBuildIo refused for a target ID the device doesn't have
     ULONG64 TargetScanTime;              // when Targets[].OldestInFlightTime was last computed, 0 never
 
+    // Descriptor ownership (version 6), see VIOSCSI_ZOMBIE. ADAPTER_EXTENSION.EventRing has the
+    // individual occurrences behind these counts.
+    ULONG64 EarlyCompletedCount;      // requests completed to Storport while the device still held them
+    ULONG64 ExtReusedWhileOwnedCount; // VioScsiBuildIo was handed an SRB extension the device still references
+    ULONG64 OrphanReturnCount;        // the device returned a request that was on no request list
+    ULONG64 OrphanUnexplainedCount;   // ...of those, ones that had not been completed early either
+    ULONG64 OrphanIntoReusedExtCount; // ...of those, ones whose extension already served another request
+    ULONG64 ZombieEvictedCount;       // early-completed requests forgotten because Zombies[] was full
+
     QUEUE_TELEMETRY Queues[MAX_CPU];
     TARGET_TELEMETRY Targets[STOR_TELEMETRY_MAX_TARGETS]; // must remain the last member
 } STOR_TELEMETRY, *PSTOR_TELEMETRY;
@@ -482,7 +500,9 @@ C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, BusResetCount) == 12 * sizeof(ULONG));
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, LastResetTime) == 96);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, SnapshotTime) == 104);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, TargetScanTime) == 120);
-C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) == 128);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, EarlyCompletedCount) == 128);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, ZombieEvictedCount) == 168);
+C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) == 176);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Queues) % sizeof(ULONG64) == 0);
 C_ASSERT(FIELD_OFFSET(STOR_TELEMETRY, Targets) == FIELD_OFFSET(STOR_TELEMETRY, Queues) + MAX_CPU * sizeof(QUEUE_TELEMETRY));
 C_ASSERT(sizeof(STOR_TELEMETRY) ==
@@ -640,7 +660,9 @@ typedef enum _VIOSCSI_EVENT_CODE
     // The device returned a request that was on a request list. Value1: used length, Value2: virtio
     // response | SCSI status << 8.
     VioScsiEventDeviceComplete = 2,
-    // The device returned a cookie (Id) that no request list holds. Value1: used length.
+    // The device returned a cookie (Id) that no request list holds. TablePa, SrbExt and Srb are those
+    // of the request completed early with that cookie, if any. Value1: used length |
+    // VIOSCSI_ORPHAN_* << 32, Value2: 100 ns since that early completion.
     VioScsiEventOrphanReturn = 3,
     // A request was completed to Storport without the device returning it, so the device may still
     // read its descriptors and write its response. Value1: VIOSCSI_EARLY_*, Value2: 100 ns since it
@@ -660,7 +682,20 @@ typedef enum _VIOSCSI_EVENT_CODE
     VioScsiEventPause = 10,
     // StorPortResume. Value2: VIOSCSI_SITE_*.
     VioScsiEventResume = 11,
+    // VioScsiBuildIo was handed an SRB extension that a request completed early still lives in, so
+    // the device can still read its old descriptors (which BuildIo is about to zero) and write its
+    // old response. Queue, Id and TablePa: that earlier request; Srb, Target and Lun: the new one.
+    // Value1: 100 ns since the earlier request was completed early, Value2: VIOSCSI_REUSE_*.
+    VioScsiEventExtReused = 12,
 } VIOSCSI_EVENT_CODE;
+
+// VioScsiEventOrphanReturn Value1 bits 32-63.
+#define VIOSCSI_ORPHAN_EARLY_COMPLETED      0x1 // the cookie belongs to a request completed early
+#define VIOSCSI_ORPHAN_EXT_REUSED           0x2 // ...whose extension already serves another request
+
+// VioScsiEventExtReused Value2.
+#define VIOSCSI_REUSE_STILL_MARKED          0x1 // the extension still had OwnedMagic set
+#define VIOSCSI_REUSE_AGAIN                 0x2 // already reused once while that request was out
 
 // VioScsiEventEarlyComplete Value1: why the request was completed early.
 #define VIOSCSI_EARLY_RESET                 1 // CompletePendingRequestsOnReset
@@ -698,6 +733,36 @@ typedef struct _VIOSCSI_EVENT_RING
     volatile LONG64 Next; // events recorded so far; event N (1-based) is in Entries[(N - 1) % EntryCount]
     VIOSCSI_EVENT Entries[VIOSCSI_EVENT_RING_SIZE];
 } VIOSCSI_EVENT_RING, *PVIOSCSI_EVENT_RING;
+
+//
+// Requests completed to Storport while the device still held them ("zombies"): reset and unit
+// removal hand requests back without waiting for the device, which keeps their descriptors and
+// will later read them and write a response into the SRB extension they live in. Each is kept
+// here until the device returns its cookie, so that VioScsiBuildIo can tell when Storport hands it
+// such an extension for a new request, and ProcessQueue can tell what a returned cookie that no
+// request list holds belonged to. SrbExt is only ever compared, never dereferenced: Storport may
+// have freed or reused that memory.
+//
+// Slots are claimed round-robin with interlocked operations; a full table overwrites the oldest
+// slot (counted in ZombieEvictedCount). Key is cleared before a slot is refilled and written last,
+// so a reader that matched it can claim the slot with a compare-exchange.
+//
+#define VIOSCSI_ZOMBIE_SLOTS 1024 // a power of two
+
+typedef struct _VIOSCSI_ZOMBIE
+{
+    volatile LONG64 Key;  // VioScsiZombieKey(Queue, Id), 0 when the slot is free
+    ULONG64 Id;           // virtqueue cookie the device will return
+    ULONG64 SrbExt;       // extension the request lived in
+    ULONG64 Srb;          // the SRB that was completed early
+    ULONG64 TablePa;      // its indirect descriptor table
+    ULONG64 Time;         // StorPerfInterruptTime() when it was completed early
+    volatile LONG Reused; // nonzero once VioScsiBuildIo was handed SrbExt for another request
+    ULONG Queue;          // request queue index
+} VIOSCSI_ZOMBIE, *PVIOSCSI_ZOMBIE;
+
+C_ASSERT((VIOSCSI_ZOMBIE_SLOTS & (VIOSCSI_ZOMBIE_SLOTS - 1)) == 0);
+C_ASSERT(sizeof(VIOSCSI_ZOMBIE) == 56);
 
 C_ASSERT((VIOSCSI_EVENT_RING_SIZE & (VIOSCSI_EVENT_RING_SIZE - 1)) == 0);
 C_ASSERT(sizeof(VIOSCSI_EVENT) == 72);
@@ -782,6 +847,9 @@ typedef struct _ADAPTER_EXTENSION
     BOOLEAN bRemoved;
     STOR_TELEMETRY Telemetry;
     VIOSCSI_EVENT_RING EventRing;
+    volatile LONG ZombieNext; // slot counter, see VIOSCSI_ZOMBIE
+    volatile LONG ZombieLive; // occupied Zombies[] slots
+    VIOSCSI_ZOMBIE Zombies[VIOSCSI_ZOMBIE_SLOTS];
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
 
 // Current time for telemetry timestamps (see the STOR_TELEMETRY timestamp notes). Returns 0
@@ -803,8 +871,8 @@ StorPerfInterruptTime(IN PADAPTER_EXTENSION adaptExt)
 // and TelemetryOffset to reach each adapter's STOR_TELEMETRY. The magic is written only by
 // the directory's static initializer, never by code, so the directory is the only place it
 // appears in the image. Same versioning rules as STOR_TELEMETRY: append fields only, bump
-// Version. Version 2 appended EventRingOffset, after Adapters[] so that a version 1 reader,
-// which only knows the fields before it, still parses the directory.
+// Version. Version 2 appended EventRingOffset and ZombiesOffset, after Adapters[] so that a
+// version 1 reader, which only knows the fields before it, still parses the directory.
 //
 #define VIOSCSI_TELEMETRY_DIRECTORY_MAGIC   0x44545356 // 'VSTD' in memory byte order
 #define VIOSCSI_TELEMETRY_DIRECTORY_VERSION 2
@@ -819,13 +887,14 @@ typedef struct _VIOSCSI_TELEMETRY_DIRECTORY
     ULONG Reserved;
     PADAPTER_EXTENSION Adapters[VIOSCSI_MAX_TELEMETRY_ADAPTERS];
     ULONG EventRingOffset; // FIELD_OFFSET(ADAPTER_EXTENSION, EventRing) (version 2)
-    ULONG Reserved2;
+    ULONG ZombiesOffset;   // FIELD_OFFSET(ADAPTER_EXTENSION, Zombies) (version 2)
 } VIOSCSI_TELEMETRY_DIRECTORY, *PVIOSCSI_TELEMETRY_DIRECTORY;
 
 C_ASSERT(FIELD_OFFSET(VIOSCSI_TELEMETRY_DIRECTORY, Adapters) == 6 * sizeof(ULONG));
 C_ASSERT(FIELD_OFFSET(VIOSCSI_TELEMETRY_DIRECTORY, Adapters) % sizeof(PVOID) == 0);
 C_ASSERT(FIELD_OFFSET(ADAPTER_EXTENSION, Telemetry) % sizeof(ULONG64) == 0);
 C_ASSERT(FIELD_OFFSET(ADAPTER_EXTENSION, EventRing) % sizeof(ULONG64) == 0);
+C_ASSERT(FIELD_OFFSET(ADAPTER_EXTENSION, Zombies) % sizeof(ULONG64) == 0);
 
 #ifndef PCIX_TABLE_POINTER
 typedef struct

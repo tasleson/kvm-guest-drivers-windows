@@ -169,6 +169,8 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         notify = virtqueue_kick_prepare(adaptExt->vq[QueueNumber]);
         element = &adaptExt->processing_srbs[vq_req_idx];
         srbExt->SubmitTime = StorPerfInterruptTime(adaptExt);
+        srbExt->OwnedTime = srbExt->SubmitTime;
+        srbExt->OwnedMagic = VIOSCSI_SRBEXT_OWNED_MAGIC;
         InsertTailList(&element->srb_list, &srbExt->list_entry);
         element->srb_cnt++;
         StorPerfSyncInFlight(queueStats, element);
@@ -978,4 +980,115 @@ VOID VioScsiRecordSrbEvent(IN PADAPTER_EXTENSION adaptExt,
                        SrbExt->TablePa,
                        Value1,
                        Value2);
+}
+
+// Zombies[] key for a request: its queue and virtqueue cookie. Cookies are never 0 (SendSRB skips
+// it), so neither is a key.
+static LONG64 VioScsiZombieKey(IN ULONG Queue, IN ULONG_PTR Id)
+{
+    return (LONG64)(((ULONG64)(Queue & 0xFF) << 56) | ((ULONG64)Id & 0x00FFFFFFFFFFFFFFULL));
+}
+
+VOID VioScsiZombieReset(IN PADAPTER_EXTENSION adaptExt)
+{
+    // Only from (re)initialization: the device was just reset and holds no requests.
+    RtlZeroMemory(adaptExt->Zombies, sizeof(adaptExt->Zombies));
+    adaptExt->ZombieLive = 0;
+    adaptExt->ZombieNext = 0;
+}
+
+// Call before the request is completed to Storport, under its queue's VioScsiVQLock: once
+// completed, Storport may hand the extension to VioScsiBuildIo for a new request on another CPU.
+VOID VioScsiZombieAdd(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt)
+{
+    PVIOSCSI_ZOMBIE zombie;
+    LONG64 evicted;
+
+    if (adaptExt->dump_mode)
+    {
+        return;
+    }
+    zombie = &adaptExt->Zombies[(ULONG)InterlockedIncrement(&adaptExt->ZombieNext) & (VIOSCSI_ZOMBIE_SLOTS - 1)];
+    // Clear the key before touching the other fields, so a concurrent VioScsiZombieTake can't
+    // match the old request and read this one's fields.
+    evicted = InterlockedExchange64(&zombie->Key, 0);
+    if (evicted != 0)
+    {
+        InterlockedDecrement(&adaptExt->ZombieLive);
+        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.ZombieEvictedCount);
+    }
+    zombie->Id = (ULONG64)SrbExt->id;
+    zombie->SrbExt = (ULONG64)(ULONG_PTR)SrbExt;
+    zombie->Srb = (ULONG64)(ULONG_PTR)SrbExt->Srb;
+    zombie->TablePa = SrbExt->TablePa;
+    zombie->Time = StorPerfInterruptTime(adaptExt);
+    zombie->Reused = 0;
+    zombie->Queue = SrbExt->QueueIndex;
+    InterlockedIncrement(&adaptExt->ZombieLive);
+    InterlockedExchange64(&zombie->Key, VioScsiZombieKey(SrbExt->QueueIndex, SrbExt->id));
+}
+
+// The device returned cookie Id on Queue and no request list holds it. If it belongs to a request
+// completed early, remove that entry and return a copy of it.
+BOOLEAN
+VioScsiZombieTake(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, IN ULONG_PTR Id, OUT PVIOSCSI_ZOMBIE Zombie)
+{
+    LONG64 key = VioScsiZombieKey(Queue, Id);
+    ULONG i;
+
+    if (adaptExt->ZombieLive <= 0)
+    {
+        return FALSE;
+    }
+    for (i = 0; i < VIOSCSI_ZOMBIE_SLOTS; i++)
+    {
+        PVIOSCSI_ZOMBIE zombie = &adaptExt->Zombies[i];
+
+        if (zombie->Key != key)
+        {
+            continue;
+        }
+        Zombie->Id = zombie->Id;
+        Zombie->SrbExt = zombie->SrbExt;
+        Zombie->Srb = zombie->Srb;
+        Zombie->TablePa = zombie->TablePa;
+        Zombie->Time = zombie->Time;
+        Zombie->Reused = zombie->Reused;
+        Zombie->Queue = zombie->Queue;
+        // Fails if VioScsiZombieAdd evicted the entry meanwhile, in which case the copy may be torn
+        // and the request is no longer known.
+        if (InterlockedCompareExchange64(&zombie->Key, 0, key) == key)
+        {
+            InterlockedDecrement(&adaptExt->ZombieLive);
+            Zombie->Key = key;
+            return TRUE;
+        }
+        return FALSE;
+    }
+    return FALSE;
+}
+
+// The entry of a request completed early that lived in SrbExt and that the device hasn't returned
+// yet, or NULL. Called by VioScsiBuildIo for every request, so it costs one read while no request
+// is outstanding that way. The entry's fields may be torn by a concurrent eviction.
+PVIOSCSI_ZOMBIE
+VioScsiZombieFindExt(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt)
+{
+    ULONG64 ext = (ULONG64)(ULONG_PTR)SrbExt;
+    ULONG i;
+
+    if (adaptExt->ZombieLive <= 0)
+    {
+        return NULL;
+    }
+    for (i = 0; i < VIOSCSI_ZOMBIE_SLOTS; i++)
+    {
+        PVIOSCSI_ZOMBIE zombie = &adaptExt->Zombies[i];
+
+        if (zombie->Key != 0 && zombie->SrbExt == ext)
+        {
+            return zombie;
+        }
+    }
+    return NULL;
 }

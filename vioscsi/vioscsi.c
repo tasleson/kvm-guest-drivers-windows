@@ -812,6 +812,8 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
         adaptExt->Telemetry.Targets[index].InFlightCount = 0;
         adaptExt->Telemetry.Targets[index].OldestInFlightTime = 0;
     }
+    // Nor does the device hold any request completed early before it was (re)initialized.
+    VioScsiZombieReset(adaptExt);
 
     if (!adaptExt->dump_mode)
     {
@@ -1456,6 +1458,8 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
                                                   VIOSCSI_EARLY_SURPRISE_REMOVAL,
                                                   currSrbExt->SubmitTime ? StorPerfInterruptTime(adaptExt) - currSrbExt->SubmitTime
                                                                          : 0);
+                            VioScsiZombieAdd(adaptExt, currSrbExt);
+                            InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.EarlyCompletedCount);
                             SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_NO_DEVICE);
                             SRB_SET_DATA_TRANSFER_LENGTH(currSrb, 0);
                             currSrbExt->SubmitTime = 0; // not a device completion, keep it out of latency stats
@@ -1484,6 +1488,51 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
 
     EXIT_FN();
     return Status;
+}
+
+// Storport handed VioScsiBuildIo an SRB extension for a new request. If a request completed early
+// (reset, unit removal) lived in it and the device hasn't returned that request, the device still
+// references this memory: zeroing it for the new request also zeroes the descriptor table the
+// device may yet read, and the device may yet write the old response over the new request.
+static VOID CheckExtensionStillReferenced(IN PADAPTER_EXTENSION adaptExt,
+                                          IN PSRB_EXTENSION srbExt,
+                                          IN PSCSI_REQUEST_BLOCK Srb,
+                                          IN UCHAR TargetId,
+                                          IN UCHAR Lun)
+{
+    PVIOSCSI_ZOMBIE zombie = VioScsiZombieFindExt(adaptExt, srbExt);
+    ULONG64 flags = 0;
+
+    if (zombie == NULL)
+    {
+        return;
+    }
+    if (srbExt->OwnedMagic == VIOSCSI_SRBEXT_OWNED_MAGIC)
+    {
+        flags |= VIOSCSI_REUSE_STILL_MARKED;
+    }
+    if (InterlockedExchange(&zombie->Reused, TRUE) != 0)
+    {
+        flags |= VIOSCSI_REUSE_AGAIN;
+    }
+    InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.ExtReusedWhileOwnedCount);
+    VioScsiRecordEvent(adaptExt,
+                       VioScsiEventExtReused,
+                       zombie->Queue,
+                       TargetId,
+                       Lun,
+                       (ULONG_PTR)zombie->Id,
+                       srbExt,
+                       Srb,
+                       zombie->TablePa,
+                       StorPerfInterruptTime(adaptExt) - zombie->Time,
+                       flags);
+    RhelDbgPrint(TRACE_LEVEL_ERROR,
+                 " SRB 0x%p reuses extension 0x%p while the device still holds request id 0x%p, table 0x%I64x\n",
+                 Srb,
+                 srbExt,
+                 (void *)(ULONG_PTR)zombie->Id,
+                 zombie->TablePa);
 }
 
 BOOLEAN
@@ -1539,6 +1588,7 @@ VioScsiBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     LOG_SRB_INFO();
 
+    CheckExtensionStillReferenced(adaptExt, srbExt, Srb, TargetId, Lun);
     RtlZeroMemory(srbExt, sizeof(*srbExt));
     srbExt->Srb = Srb;
     srbExt->TargetId = TargetId;
@@ -1662,6 +1712,53 @@ VOID FORCEINLINE DispatchQueue(IN PVOID DeviceExtension, IN ULONG MessageId)
     EXIT_FN();
 }
 
+// The device returned a cookie that no request list holds. Expected only for requests completed
+// early (reset, unit removal), whose entries in Zombies[] say what they were; anything else means
+// the request lists and the virtqueue disagree. Called under the queue's VioScsiVQLock.
+static VOID RecordOrphanReturn(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, IN ULONG_PTR Id, IN ULONG Len)
+{
+    VIOSCSI_ZOMBIE zombie = {0};
+    ULONG64 flags = 0;
+    ULONG64 age = 0;
+
+    InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.OrphanReturnCount);
+    if (VioScsiZombieTake(adaptExt, Queue, Id, &zombie))
+    {
+        flags |= VIOSCSI_ORPHAN_EARLY_COMPLETED;
+        age = StorPerfInterruptTime(adaptExt) - zombie.Time;
+        if (zombie.Reused)
+        {
+            // The device has just written this request's response into an extension that belongs
+            // to another request by now.
+            flags |= VIOSCSI_ORPHAN_EXT_REUSED;
+            InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.OrphanIntoReusedExtCount);
+            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                         " Request id 0x%p returned into extension 0x%p, already reused by another request\n",
+                         (void *)Id,
+                         (void *)(ULONG_PTR)zombie.SrbExt);
+        }
+    }
+    else
+    {
+        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.OrphanUnexplainedCount);
+        RhelDbgPrint(TRACE_LEVEL_ERROR,
+                     " Request id 0x%p returned on queue %lu was never completed early\n",
+                     (void *)Id,
+                     Queue);
+    }
+    VioScsiRecordEvent(adaptExt,
+                       VioScsiEventOrphanReturn,
+                       Queue,
+                       0,
+                       0,
+                       Id,
+                       (PVOID)(ULONG_PTR)zombie.SrbExt,
+                       (PVOID)(ULONG_PTR)zombie.Srb,
+                       zombie.TablePa,
+                       Len | (flags << 32),
+                       age);
+}
+
 VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr)
 {
     ULONG_PTR srbId;
@@ -1721,21 +1818,12 @@ VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr)
             if (!bFound)
             {
                 RhelDbgPrint(TRACE_LEVEL_WARNING, " No SRB found for ID 0x%p\n", (void *)srbId);
-                VioScsiRecordEvent(adaptExt,
-                                   VioScsiEventOrphanReturn,
-                                   index - VIRTIO_SCSI_REQUEST_QUEUE_0,
-                                   0,
-                                   0,
-                                   srbId,
-                                   NULL,
-                                   NULL,
-                                   0,
-                                   len,
-                                   0);
+                RecordOrphanReturn(adaptExt, index - VIRTIO_SCSI_REQUEST_QUEUE_0, srbId, len);
             }
 
             if (bFound)
             {
+                srbExt->OwnedMagic = 0;
                 VioScsiRecordSrbEvent(adaptExt,
                                       VioScsiEventDeviceComplete,
                                       srbExt,
@@ -1811,6 +1899,8 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension, IN UCHAR TargetId,
                                           VIOSCSI_EARLY_RESET,
                                           currSrbExt->SubmitTime ? StorPerfInterruptTime(adaptExt) - currSrbExt->SubmitTime
                                                                  : 0);
+                    VioScsiZombieAdd(adaptExt, currSrbExt);
+                    InterlockedIncrement64((PLONG64)&adaptExt->Telemetry.EarlyCompletedCount);
                     earlyCount++;
                     if (currSrb)
                     {

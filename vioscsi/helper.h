@@ -167,6 +167,16 @@ VOID VioScsiRecordSrbEvent(IN PADAPTER_EXTENSION adaptExt,
                            IN ULONG64 Value1,
                            IN ULONG64 Value2);
 
+VOID VioScsiZombieReset(IN PADAPTER_EXTENSION adaptExt);
+
+VOID VioScsiZombieAdd(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt);
+
+BOOLEAN
+VioScsiZombieTake(IN PADAPTER_EXTENSION adaptExt, IN ULONG Queue, IN ULONG_PTR Id, OUT PVIOSCSI_ZOMBIE Zombie);
+
+PVIOSCSI_ZOMBIE
+VioScsiZombieFindExt(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION SrbExt);
+
 extern VirtIOSystemOps VioScsiSystemOps;
 
 #endif ___HELPER_H___
