@@ -8,7 +8,7 @@ This directory contains diagnostic tools for Windows guest systems running virti
 - **GetVirtioWinInfo.ps1** - Quick version check and reboot status (~5 seconds)
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics from WinPE/WinRE
 - **GetVioScsiTelemetry.ps1** - vioscsi per-queue and per-target I/O, latency and error counters from a running system
-- **vioscsi_telemetry.js** - WinDbg script showing the same vioscsi counters from a kernel crash dump
+- **vioscsi_telemetry.js** - WinDbg script showing the same vioscsi counters from a kernel crash dump, plus the per-adapter event ring
 - **GetVioScsiDriverInfo.ps1** - Which vioscsi driver is installed and loaded (file hash, version, driver store, boot time), to confirm a new build is the one running
 
 ---
@@ -276,6 +276,18 @@ Counters accumulate from when the adapter was started and cannot be cleared, so 
 two snapshots to see what changed over an interval. Latency percentiles are upper bounds of
 the histogram bucket they fall in (buckets double in width).
 
+From telemetry version 6 the summary also has descriptor ownership counters. A reset (and a
+unit's surprise removal) completes the requests still on the virtqueue back to Storport
+without waiting for the device, which keeps their descriptors and later writes their
+responses. The driver counts those early completions, the times `VioScsiBuildIo` was handed
+an SRB extension for a new request while the device still referenced it (it zeroes the
+extension, including the indirect descriptor table inside it), and the requests the device
+returned that were on no request list: early-completed ones, ones returned into an extension
+already serving another request, and unexplained ones. It also counts requests it refused
+because their scatter/gather list had a zero-length element or more elements than the
+adapter allows, which would have made the device stop servicing the adapter. The individual
+occurrences are only in a dump; see [the event ring](#event-ring).
+
 ## Usage
 
 ```powershell
@@ -359,6 +371,60 @@ Either way it is slow over very large ranges, so keep it to a region you have re
 
 With symbols, the raw structure is also available directly, e.g.
 `dx -r2 ((vioscsi!_ADAPTER_EXTENSION *)<address>)->Telemetry`.
+
+## Event ring
+
+Each adapter also keeps its last 8192 events in `EventRing` in the adapter extension
+(`VIOSCSI_EVENT_RING` in `vioscsi/vioscsi.h`, which documents every event code): each
+request as it goes onto a virtqueue (`Publish`) and as the device returns it
+(`DeviceComplete`), requests completed without the device (`EarlyComplete`), cookies the
+device returned that no request list held (`OrphanReturn`), SRB extensions reused while the
+device still referenced them (`ExtReused`), reset SRBs, TMFs sent, coalesced and reaped,
+`StorPortPause`/`Resume`, and refused scatter/gather lists. Every request event carries the
+physical address of the request's indirect descriptor table (`TablePa`): the address QEMU
+reports for the head descriptor of a chain it rejects, e.g. for "virtio: zero sized buffers
+are not allowed". Requests completed early that the device hasn't returned yet are listed
+in `Zombies` until it does. Neither is recorded by the crash dump instance of the driver.
+
+```
+!vioscsi_events                          # last 64 events of every adapter, and its zombies
+!vioscsi_events 0 0 1000                 # last 1000
+!vioscsi_events 0 <table PA>             # every event of the request(s) that owned that table
+!vioscsi_events <adapter extension>      # one adapter
+dx @$vioscsiEvents()                     # decoded events and zombies as objects
+```
+
+Ages are measured against the dump's interrupt time. To find out what happened to the
+request QEMU choked on, take the table address from QEMU's report and run
+`!vioscsi_events 0 <table PA>`. The events are matched by `TablePa` and by SRB extension,
+since the table lives in the extension. Read the result like this:
+
+- `ExtReused` for that table before the break: the device still referenced the extension
+  when `VioScsiBuildIo` zeroed it for another request. The `Publish`, `EarlyComplete` and
+  `ExtReused` sequence shows the request being handed back early and its memory reused.
+- A `Publish` and nothing after it, with no zero length found by `ZeroLengthDesc`: the
+  driver published a valid table and did not touch it again, so the zero came from
+  elsewhere.
+- `ZeroLengthDesc`: the zero was in the table as the driver built it.
+- `SgZeroLength`/`SgTooManyElements`: Storport handed the driver a list that would have
+  broken the virtqueue; the request was refused instead.
+- `OrphanReturn` flagged `NOT A REQUEST COMPLETED EARLY`: the device returned a cookie the
+  driver never handed back early, so the request lists and the virtqueue disagree.
+
+The script finds the ring through the telemetry directory (version 2 adds the ring and
+zombie table offsets), with or without symbols. With symbols the structures can also be
+read directly:
+
+```
+dx vioscsi!VioScsiTelemetryDirectory.Adapters
+dx -g ((vioscsi!_ADAPTER_EXTENSION *)<adapter>)->EventRing.Entries.Where(e => e.TablePa == <table PA>)
+dx -g ((vioscsi!_ADAPTER_EXTENSION *)<adapter>)->Zombies.Where(z => z.Key != 0)
+dt vioscsi!_SRB_EXTENSION <SrbExt> OwnedMagic OwnedTime TablePa id QueueIndex
+```
+
+Entries are in slot order there; `Sequence` gives the order (slot `(Sequence - 1) % 8192`).
+An extension whose `OwnedMagic` is `0x444E574F` was put on a virtqueue at `OwnedTime` and the
+device had not returned it.
 
 ---
 
