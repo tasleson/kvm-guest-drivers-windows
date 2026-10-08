@@ -21,6 +21,13 @@
     request outstanding 5 seconds or more). Counters are cumulative since the adapter was
     started; take two snapshots to compute rates.
 
+    From telemetry version 6 it also reports descriptor ownership: requests a reset completed
+    while the device still held them, SRB extensions reused while the device still referenced
+    them, requests the device returned that no request list held, and requests refused for a
+    scatter/gather list that would have produced a zero-length or truncated descriptor chain.
+    The individual occurrences are in the adapter's event ring, which only a kernel dump shows
+    (Tools/debug/vioscsi_telemetry.js, !vioscsi_events).
+
     Requires Administrator rights and a vioscsi driver with telemetry version 5 or
     later. A blob saved with -SaveRaw can be parsed later, on any machine, with -InputFile.
 
@@ -101,6 +108,10 @@ $STOR_TELEMETRY_MIN_VERSION     = 5
 # adapter-wide ULONG64s up to TargetScanTime. The first 28 bytes are enough to size a retry.
 $HEADER_SIZE_FIELDS             = 28
 $HEADER_MIN_SIZE                = 128
+# Version 6 appends ten ULONG64s: EarlyCompletedCount, ExtReusedWhileOwnedCount,
+# OrphanReturnCount, OrphanUnexplainedCount, OrphanIntoReusedExtCount, ZombieEvictedCount,
+# SgZeroLengthCount, SgTooManyElementsCount, SgLengthMismatchCount, ZeroLengthDescCount.
+$HEADER_V6_SIZE                 = 208
 # QUEUE_TELEMETRY ends with 56 bytes after QueueFullCount: OldestInFlightTime,
 # LastCompletionTime, MaxLatencyTime, Slow1s/5s/30sCount (ULONG64s), InFlightCount and a
 # ULONG of padding.
@@ -466,6 +477,10 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
         }
     }
 
+    # Descriptor ownership and request validation counters, $null before version 6.
+    $v6 = ($version -ge 6 -and $headerSize -ge $HEADER_V6_SIZE -and $Data.Length -ge $HEADER_V6_SIZE)
+    $v6u64 = { param($Offset) if ($v6) { & $u64 $Offset } else { $null } }
+
     [PSCustomObject]@{
         Source                      = $Source
         Version                     = $version
@@ -480,6 +495,16 @@ function ConvertFrom-VioScsiTelemetry([byte[]]$Data, [string]$Source) {
         LastResetTime               = & $u64 96
         LastResetAgeUs              = Get-AgeUs $snapshotTime (& $u64 96)
         OutOfRangeTargetCount       = & $u64 112
+        EarlyCompletedCount         = & $v6u64 128
+        ExtReusedWhileOwnedCount    = & $v6u64 136
+        OrphanReturnCount           = & $v6u64 144
+        OrphanUnexplainedCount      = & $v6u64 152
+        OrphanIntoReusedExtCount    = & $v6u64 160
+        ZombieEvictedCount          = & $v6u64 168
+        SgZeroLengthCount           = & $v6u64 176
+        SgTooManyElementsCount      = & $v6u64 184
+        SgLengthMismatchCount       = & $v6u64 192
+        ZeroLengthDescCount         = & $v6u64 200
         Queues                      = $queues
         Targets                     = $targets
         Total                       = [PSCustomObject]$total
@@ -527,6 +552,18 @@ function Write-TelemetrySummary($T) {
     Write-Host ("Last reset: {0}" -f $lastReset)
     if ($T.OutOfRangeTargetCount) {
         Write-Host ("Requests refused for a target ID beyond the device's maximum: {0}" -f $T.OutOfRangeTargetCount)
+    }
+    if ($null -ne $T.EarlyCompletedCount) {
+        # Always shown from version 6: zeros here rule out early completion as the cause of a
+        # broken virtqueue.
+        Write-Host ("Descriptor ownership: completed while the device held them {0}; extension reused while still referenced {1}" -f
+                    $T.EarlyCompletedCount, $T.ExtReusedWhileOwnedCount)
+        Write-Host ("Returned by the device but on no request list: {0} (never completed early {1}, into a reused extension {2}; forgotten, table full {3})" -f
+                    $T.OrphanReturnCount, $T.OrphanUnexplainedCount, $T.OrphanIntoReusedExtCount, $T.ZombieEvictedCount)
+        if ($T.SgZeroLengthCount -or $T.SgTooManyElementsCount -or $T.SgLengthMismatchCount -or $T.ZeroLengthDescCount) {
+            Write-Host ("Scatter/gather: refused zero-length element {0}, too many elements {1}; length mismatch {2}; zero-length descriptor published {3}" -f
+                        $T.SgZeroLengthCount, $T.SgTooManyElementsCount, $T.SgLengthMismatchCount, $T.ZeroLengthDescCount)
+        }
     }
     $rows | Format-Table -AutoSize -Property Queue, Reads, Writes, Flushes, Unmaps, Other,
         @{ n = 'ReadMB'; e = { '{0:N1}' -f ($_.ReadBytes / 1MB) }; a = 'right' },
