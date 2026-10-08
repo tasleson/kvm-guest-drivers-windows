@@ -667,7 +667,11 @@ StorPerfTargetActive(IN PTARGET_TELEMETRY Target)
 #define VIOSCSI_EVENT_RING_MAGIC   0x47525645 // 'EVRG' in memory byte order
 #define VIOSCSI_EVENT_RING_VERSION 2
 #define VIOSCSI_EVENT_RING_PACKED  0x1 // Flags: packed virtqueues, so no AvailPos is recorded
-#define VIOSCSI_EVENT_RING_SIZE    8192 // a power of two
+// A power of two. Sized for the reset investigation rather than for production: at a few hundred
+// requests per second an adapter records two events per request, and a LUN reset TMF can take
+// over 10 s in QEMU, so 32768 events (about 2.3 MB of nonpaged device extension per adapter)
+// still reach back before the reset that precedes a ring break.
+#define VIOSCSI_EVENT_RING_SIZE    32768
 #define VIOSCSI_EVENT_NO_QUEUE     0xFFFF
 
 typedef enum _VIOSCSI_EVENT_CODE
@@ -811,6 +815,7 @@ C_ASSERT(VIOSCSI_ZOMBIE_PROBES >= 1 && VIOSCSI_ZOMBIE_PROBES <= VIOSCSI_ZOMBIE_S
 C_ASSERT((VIOSCSI_EVENT_RING_SIZE & (VIOSCSI_EVENT_RING_SIZE - 1)) == 0);
 C_ASSERT(sizeof(VIOSCSI_EVENT) == 72);
 C_ASSERT(FIELD_OFFSET(VIOSCSI_EVENT_RING, Entries) == 32);
+C_ASSERT(sizeof(VIOSCSI_EVENT_RING) == 32 + VIOSCSI_EVENT_RING_SIZE * 72);
 
 typedef struct virtio_bar
 {

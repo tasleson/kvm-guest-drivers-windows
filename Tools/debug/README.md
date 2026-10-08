@@ -374,7 +374,7 @@ With symbols, the raw structure is also available directly, e.g.
 
 ## Event ring
 
-Each adapter also keeps its last 8192 events in `EventRing` in the adapter extension
+Each adapter also keeps its last 32768 events in `EventRing` in the adapter extension
 (`VIOSCSI_EVENT_RING` in `vioscsi/vioscsi.h`, which documents every event code): each
 request as it goes onto a virtqueue (`Publish`) and as the device returns it
 (`DeviceComplete`), requests completed without the device (`EarlyComplete`), cookies the
@@ -385,6 +385,11 @@ physical address of the request's indirect descriptor table (`TablePa`): the add
 reports for the head descriptor of a chain it rejects, e.g. for "virtio: zero sized buffers
 are not allowed". Requests completed early that the device hasn't returned yet are listed
 in `Zombies` until it does. Neither is recorded by the crash dump instance of the driver.
+
+The ring is sized for investigating virtqueue breaks after resets, not for production: about
+2.3 MB of nonpaged device extension per adapter (`VIOSCSI_EVENT_RING_SIZE` in
+`vioscsi/vioscsi.h`), enough to reach back across a reset TMF that takes several seconds on a
+busy adapter.
 
 ```
 !vioscsi_events                          # last 64 events of every adapter, and its zombies
@@ -424,7 +429,7 @@ dx -g ((vioscsi!_ADAPTER_EXTENSION *)<adapter>)->Zombies.Where(z => z.Key != 0)
 dt vioscsi!_SRB_EXTENSION <SrbExt> OwnedMagic OwnedTime TablePa id QueueIndex
 ```
 
-Entries are in slot order there; `Sequence` gives the order (slot `(Sequence - 1) % 8192`).
+Entries are in slot order there; `Sequence` gives the order (slot `(Sequence - 1) % 32768`).
 An extension whose `OwnedMagic` is `0x444E574F` was put on a virtqueue at `OwnedTime` and the
 device had not returned it.
 
