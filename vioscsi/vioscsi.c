@@ -934,15 +934,46 @@ VOID HandleResponse(IN PVOID DeviceExtension, IN PVirtIOSCSICmd cmd)
     EXIT_FN();
 }
 
+static VOID ProcessTMFCompletion(IN PVOID DeviceExtension)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    PVirtIOSCSICmd cmd;
+    PSRB_TYPE Srb;
+    unsigned int len;
+
+    if (!adaptExt->tmf_infly)
+    {
+        return;
+    }
+
+    while ((cmd = (PVirtIOSCSICmd)virtqueue_get_buf(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE], &len)) != NULL)
+    {
+        VirtIOSCSICtrlTMFResp *resp;
+        Srb = (PSRB_TYPE)cmd->srb;
+        ASSERT(Srb == (PSRB_TYPE)&adaptExt->tmf_cmd.Srb);
+        resp = &cmd->resp.tmf;
+        switch (resp->response)
+        {
+            case VIRTIO_SCSI_S_OK:
+            case VIRTIO_SCSI_S_FUNCTION_SUCCEEDED:
+                break;
+            default:
+                RhelDbgPrint(TRACE_LEVEL_ERROR, " Unknown response %d\n", resp->response);
+                ASSERT(0);
+                break;
+        }
+        StorPortResume(DeviceExtension);
+    }
+    adaptExt->tmf_infly = FALSE;
+}
+
 BOOLEAN
 VioScsiInterrupt(IN PVOID DeviceExtension)
 {
-    PVirtIOSCSICmd cmd = NULL;
     PVirtIOSCSIEventNode evtNode = NULL;
     unsigned int len = 0;
     PADAPTER_EXTENSION adaptExt = NULL;
     BOOLEAN isInterruptServiced = FALSE;
-    PSRB_TYPE Srb = NULL;
     ULONG intReason = 0;
 
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
@@ -961,28 +992,7 @@ VioScsiInterrupt(IN PVOID DeviceExtension)
     {
         isInterruptServiced = TRUE;
 
-        if (adaptExt->tmf_infly)
-        {
-            while ((cmd = (PVirtIOSCSICmd)virtqueue_get_buf(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE], &len)) != NULL)
-            {
-                VirtIOSCSICtrlTMFResp *resp;
-                Srb = (PSRB_TYPE)cmd->srb;
-                ASSERT(Srb == (PSRB_TYPE)&adaptExt->tmf_cmd.Srb);
-                resp = &cmd->resp.tmf;
-                switch (resp->response)
-                {
-                    case VIRTIO_SCSI_S_OK:
-                    case VIRTIO_SCSI_S_FUNCTION_SUCCEEDED:
-                        break;
-                    default:
-                        RhelDbgPrint(TRACE_LEVEL_ERROR, " unknown response %d\n", resp->response);
-                        ASSERT(0);
-                        break;
-                }
-                StorPortResume(DeviceExtension);
-            }
-            adaptExt->tmf_infly = FALSE;
-        }
+        ProcessTMFCompletion(DeviceExtension);
         while ((evtNode = (PVirtIOSCSIEventNode)virtqueue_get_buf(adaptExt->vq[VIRTIO_SCSI_EVENTS_QUEUE], &len)) !=
                NULL)
         {
@@ -1023,11 +1033,9 @@ VioScsiInterrupt(IN PVOID DeviceExtension)
 
 static BOOLEAN VioScsiMSInterruptWorker(IN PVOID DeviceExtension, IN ULONG MessageID)
 {
-    PVirtIOSCSICmd cmd;
     PVirtIOSCSIEventNode evtNode;
     unsigned int len;
     PADAPTER_EXTENSION adaptExt;
-    PSRB_TYPE Srb = NULL;
     ULONG intReason = 0;
 
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
@@ -1045,28 +1053,7 @@ static BOOLEAN VioScsiMSInterruptWorker(IN PVOID DeviceExtension, IN ULONG Messa
     }
     if (MessageID == QUEUE_TO_MESSAGE(VIRTIO_SCSI_CONTROL_QUEUE))
     {
-        if (adaptExt->tmf_infly)
-        {
-            while ((cmd = (PVirtIOSCSICmd)virtqueue_get_buf(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE], &len)) != NULL)
-            {
-                VirtIOSCSICtrlTMFResp *resp;
-                Srb = (PSRB_TYPE)(cmd->srb);
-                ASSERT(Srb == (PSRB_TYPE)&adaptExt->tmf_cmd.Srb);
-                resp = &cmd->resp.tmf;
-                switch (resp->response)
-                {
-                    case VIRTIO_SCSI_S_OK:
-                    case VIRTIO_SCSI_S_FUNCTION_SUCCEEDED:
-                        break;
-                    default:
-                        RhelDbgPrint(TRACE_LEVEL_ERROR, " Unknown response %d\n", resp->response);
-                        ASSERT(0);
-                        break;
-                }
-                StorPortResume(DeviceExtension);
-            }
-            adaptExt->tmf_infly = FALSE;
-        }
+        ProcessTMFCompletion(DeviceExtension);
         return TRUE;
     }
     if (MessageID == QUEUE_TO_MESSAGE(VIRTIO_SCSI_EVENTS_QUEUE))
