@@ -109,7 +109,7 @@ SendTMF(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
 VOID ShutDown(IN PVOID DeviceExtension);
 
 BOOLEAN
-DeviceReset(IN PVOID DeviceExtension);
+DeviceReset(IN PVOID DeviceExtension, IN UCHAR TargetId, IN UCHAR Lun);
 
 VOID GetScsiConfig(IN PVOID DeviceExtension);
 VOID SetGuestFeatures(IN PVOID DeviceExtension);

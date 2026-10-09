@@ -1130,7 +1130,9 @@ VioScsiResetBus(IN PVOID DeviceExtension, IN ULONG PathId)
 {
     UNREFERENCED_PARAMETER(PathId);
 
-    return DeviceReset(DeviceExtension);
+    // Storport hands HwResetBus a path, not a target, and tmf_cmd carries one TMF at a
+    // time, so there is no single target to address here: send the TMF to target 0.
+    return DeviceReset(DeviceExtension, 0, 0);
 }
 
 SCSI_ADAPTER_CONTROL_STATUS
@@ -1497,7 +1499,7 @@ VOID VioScsiCompleteDpcRoutine(IN PSTOR_DPC Dpc, IN PVOID Context, IN PVOID Syst
     EXIT_FN();
 }
 
-VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
+VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension, IN UCHAR TargetId, IN UCHAR Lun)
 {
     PADAPTER_EXTENSION adaptExt;
     ULONG QueueNum;
@@ -1509,7 +1511,7 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
     {
         adaptExt->reset_in_progress = TRUE;
         StorPortPause(DeviceExtension, 10);
-        DeviceReset(DeviceExtension);
+        DeviceReset(DeviceExtension, TargetId, Lun);
 
         for (ULONG index = 0; index < adaptExt->num_queues; index++)
         {
@@ -1633,10 +1635,23 @@ PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
             switch (adaptExt->action_on_reset)
             {
                 case VioscsiResetCompleteRequests:
-                    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Completing all pending SRBs\n");
-                    CompletePendingRequestsOnReset(DeviceExtension);
-                    SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
-                    return TRUE;
+                    {
+                        UCHAR resetTarget = 0;
+                        UCHAR resetLun = 0;
+
+                        // A bus reset names no target. Target and LUN resets name the one that
+                        // stopped responding, and that is where the TMF has to go.
+                        if (SRB_FUNCTION(Srb) != SRB_FUNCTION_RESET_BUS)
+                        {
+                            resetTarget = SRB_TARGET_ID(Srb);
+                            resetLun = SRB_LUN(Srb);
+                        }
+
+                        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Completing all pending SRBs\n");
+                        CompletePendingRequestsOnReset(DeviceExtension, resetTarget, resetLun);
+                        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
+                        return TRUE;
+                    }
                 case VioscsiResetDoNothing:
                     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Doing nothing with all pending SRBs\n");
                     SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
