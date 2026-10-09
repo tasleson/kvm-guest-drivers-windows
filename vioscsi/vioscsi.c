@@ -442,7 +442,7 @@ VioScsiFindAdapter(IN PVOID DeviceExtension,
         adaptExt->num_queues = min(adaptExt->num_queues, (USHORT)num_cpus);
     }
 
-    adaptExt->action_on_reset = VioscsiResetCompleteRequests;
+    adaptExt->action_on_reset = VioscsiResetSendTmf;
     VioScsiReadRegistryParameter(DeviceExtension,
                                  REGISTRY_ACTION_ON_RESET,
                                  FIELD_OFFSET(ADAPTER_EXTENSION, action_on_reset));
@@ -1552,6 +1552,48 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension, IN UCHAR TargetId,
     adaptExt->reset_in_progress = FALSE;
 }
 
+// Handles a reset SRB under VioscsiResetSendTmf (the default, and any action_on_reset value
+// PreProcessRequest doesn't handle itself) or VioscsiResetCompleteRequests, and returns the
+// status to complete it with.
+static UCHAR ProcessResetRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    UCHAR resetTarget = 0;
+    UCHAR resetLun = 0;
+    BOOLEAN tmfPosted = TRUE;
+
+    // A bus reset names no target. Target and LUN resets name the one that
+    // stopped responding, and that is where the TMF has to go.
+    if (SRB_FUNCTION(Srb) != SRB_FUNCTION_RESET_BUS)
+    {
+        resetTarget = SRB_TARGET_ID(Srb);
+        resetLun = SRB_LUN(Srb);
+    }
+
+    if (adaptExt->action_on_reset == VioscsiResetCompleteRequests)
+    {
+        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Completing all pending SRBs\n");
+        CompletePendingRequestsOnReset(DeviceExtension, resetTarget, resetLun);
+    }
+    else
+    {
+        // Nothing is completed here. A buffer the driver has made available stays the
+        // device's until it comes back on the used ring, and only a device reset takes it
+        // back sooner; a TMF doesn't. Before it answers the TMF, QEMU cancels the reset LUN's
+        // requests in progress and returns them on the used ring (VIRTIO_SCSI_S_RESET, which
+        // HandleResponse turns into SRB_STATUS_BUS_RESET); ones it hasn't read yet, and
+        // requests to other targets, run as usual. Completing them here instead lets Storport
+        // reuse their SRB extensions, and the indirect descriptor tables in them, while the
+        // device can still read them. When DeviceReset posts the TMF it pauses the adapter
+        // until the TMF is reaped (for up to 60 s); a reset folded into one in flight doesn't.
+        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Sending a TMF, leaving pending SRBs to the device\n");
+        tmfPosted = DeviceReset(DeviceExtension, resetTarget, resetLun);
+    }
+    // A TMF that couldn't be posted reset nothing; fail the SRB so that Storport escalates
+    // instead of waiting on requests nobody cancelled.
+    return tmfPosted ? SRB_STATUS_SUCCESS : SRB_STATUS_ERROR;
+}
+
 UCHAR
 VioScsiProcessPnP(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
 {
@@ -1634,24 +1676,6 @@ PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                          Srb);
             switch (adaptExt->action_on_reset)
             {
-                case VioscsiResetCompleteRequests:
-                    {
-                        UCHAR resetTarget = 0;
-                        UCHAR resetLun = 0;
-
-                        // A bus reset names no target. Target and LUN resets name the one that
-                        // stopped responding, and that is where the TMF has to go.
-                        if (SRB_FUNCTION(Srb) != SRB_FUNCTION_RESET_BUS)
-                        {
-                            resetTarget = SRB_TARGET_ID(Srb);
-                            resetLun = SRB_LUN(Srb);
-                        }
-
-                        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Completing all pending SRBs\n");
-                        CompletePendingRequestsOnReset(DeviceExtension, resetTarget, resetLun);
-                        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
-                        return TRUE;
-                    }
                 case VioscsiResetDoNothing:
                     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Doing nothing with all pending SRBs\n");
                     SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
@@ -1659,6 +1683,9 @@ PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                 case VioscsiResetBugCheck:
                     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Let's bugcheck due to this reset event\n");
                     KeBugCheckEx(0xDEADDEAD, (ULONG_PTR)Srb, SRB_PATH_ID(Srb), SRB_TARGET_ID(Srb), SRB_LUN(Srb));
+                    return TRUE;
+                default:
+                    SRB_SET_SRB_STATUS(Srb, ProcessResetRequest(DeviceExtension, Srb));
                     return TRUE;
             }
         case SRB_FUNCTION_WMI:

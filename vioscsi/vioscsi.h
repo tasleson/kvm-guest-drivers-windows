@@ -287,10 +287,20 @@ typedef struct virtio_bar
     BOOLEAN bPortSpace;
 } VIRTIO_BAR, *PVIRTIO_BAR;
 
+// What a reset SRB does (registry VioscsiActionOnReset). The default is set in
+// VioScsiFindAdapter.
 typedef enum ACTION_ON_RESET
 {
+    // Post the TMF, then complete every request on every queue to Storport while the device
+    // still holds them. Storport reuses their SRB extensions, and with them the descriptor
+    // tables the device has yet to read, so this can corrupt the virtqueue. Kept so that an
+    // explicitly configured 0 keeps its meaning.
     VioscsiResetCompleteRequests,
     VioscsiResetDoNothing,
+    // Post a TMF to the SRB's target and LUN (0:0 for a bus reset) and leave every request with
+    // the device, which returns each one on the used ring. The default, and what any value not
+    // listed here does.
+    VioscsiResetSendTmf,
     VioscsiResetBugCheck = 0xDEADDEAD,
 } ACTION_ON_RESET;
 
