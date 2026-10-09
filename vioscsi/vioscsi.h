@@ -465,6 +465,8 @@ typedef struct _STOR_TELEMETRY
     ULONG64 BusResetCount;
     ULONG64 DeviceResetCount;
     ULONG64 LogicalUnitResetCount;
+    // Time spent handling a reset SRB: with VioscsiResetSendTmf only posting the TMF, with
+    // VioscsiResetCompleteRequests also completing every queue. Neither waits for the TMF.
     ULONG64 LastResetDurationUs;
     ULONG64 MaxResetDurationUs;
     ULONG64 DeviceResetTmfInFlightCount; // DeviceReset() coalesced into a TMF already in flight
@@ -825,10 +827,19 @@ typedef struct virtio_bar
     BOOLEAN bPortSpace;
 } VIRTIO_BAR, *PVIRTIO_BAR;
 
+// What a reset SRB does (registry VioscsiActionOnReset). The values are recorded in the event
+// ring, so they keep their meaning across builds; the default is set in VioScsiFindAdapter.
 typedef enum ACTION_ON_RESET
 {
+    // The old default: post the TMF, then complete every request on every queue to Storport
+    // while the device still holds them. Storport reuses their SRB extensions, and with them
+    // the descriptor tables the device has yet to read. Kept only for comparison runs.
     VioscsiResetCompleteRequests,
     VioscsiResetDoNothing,
+    // Post a TMF to the SRB's target and LUN (0:0 for a bus reset) and leave every request with
+    // the device, which returns each one on the used ring. The default, and what any value not
+    // listed here does.
+    VioscsiResetSendTmf,
     VioscsiResetBugCheck = 0xDEADDEAD,
 } ACTION_ON_RESET;
 

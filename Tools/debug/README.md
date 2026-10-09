@@ -277,17 +277,18 @@ Counters accumulate from when the adapter was started and cannot be cleared, so 
 two snapshots to see what changed over an interval. Latency percentiles are upper bounds of
 the histogram bucket they fall in (buckets double in width).
 
-From telemetry version 6 the summary also has descriptor ownership counters. A reset (and a
-unit's surprise removal) completes the requests still on the virtqueue back to Storport
-without waiting for the device, which keeps their descriptors and later writes their
-responses. The driver counts those early completions, the times `VioScsiBuildIo` was handed
-an SRB extension for a new request while the device still referenced it (it zeroes the
-extension, including the indirect descriptor table inside it), and the requests the device
-returned that were on no request list: early-completed ones, ones returned into an extension
-already serving another request, and unexplained ones. It also counts requests it refused
-because their scatter/gather list had a zero-length element or more elements than the
-adapter allows, which would have made the device stop servicing the adapter. The individual
-occurrences are only in a dump; see [the event ring](#event-ring).
+From telemetry version 6 the summary also has descriptor ownership counters. A unit's
+surprise removal, and a reset with `VioscsiActionOnReset` set to 0 (the old default, now kept
+for comparison runs; resets now leave requests to the device), complete the requests still on
+the virtqueue back to Storport without waiting for the device, which keeps their descriptors
+and later writes their responses. The driver counts those early completions, the times
+`VioScsiBuildIo` was handed an SRB extension for a new request while the device still
+referenced it (it zeroes the extension, including the indirect descriptor table inside it),
+and the requests the device returned that were on no request list: early-completed ones,
+ones returned into an extension already serving another request, and unexplained ones. It
+also counts requests it refused because their scatter/gather list had a zero-length element
+or more elements than the adapter allows, which would have made the device stop servicing
+the adapter. The individual occurrences are only in a dump; see [the event ring](#event-ring).
 
 ## Usage
 
@@ -511,7 +512,7 @@ virtqueue_chain_error dev=scsi1 queue=3 pos=37539 head=141 addr=0x2762d25c8 ...
 run `evring.py chain break.dmp 0x2762d25c8 3 37539 --resets` and read the result as described
 under [From a QEMU chain error to the guest's events](#from-a-qemu-chain-error-to-the-guests-events).
 `--resets` is what puts an `EarlyComplete` and the `ExtReused` that follows it next to the reset
-that caused them.
+that caused them, on a driver completing requests early on reset (`VioscsiActionOnReset` 0).
 
 ---
 
