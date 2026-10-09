@@ -940,6 +940,7 @@ static VOID ProcessTMFCompletion(IN PVOID DeviceExtension)
     PVirtIOSCSICmd cmd;
     PSRB_TYPE Srb;
     unsigned int len;
+    BOOLEAN reaped = FALSE;
 
     if (!adaptExt->tmf_infly)
     {
@@ -962,9 +963,21 @@ static VOID ProcessTMFCompletion(IN PVOID DeviceExtension)
                 ASSERT(0);
                 break;
         }
-        StorPortResume(DeviceExtension);
+        reaped = TRUE;
     }
-    adaptExt->tmf_infly = FALSE;
+
+    // Only hand tmf_cmd back to DeviceReset once the device has actually returned it. The
+    // INTx ISR gets here for every interrupt, most of them request queue completions, so
+    // clearing the flag unconditionally would let the next reset rebuild tmf_cmd while the
+    // TMF is still outstanding on the control queue. Resume before releasing it: StorPortPause
+    // and StorPortResume act on the whole adapter, so if the flag went first, a reset on
+    // another CPU could claim it and pause, and this resume would then undo that pause
+    // while the new TMF is outstanding.
+    if (reaped)
+    {
+        StorPortResume(DeviceExtension);
+        InterlockedExchange(&adaptExt->tmf_infly, FALSE);
+    }
 }
 
 BOOLEAN
