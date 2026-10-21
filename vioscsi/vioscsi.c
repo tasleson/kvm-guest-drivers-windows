@@ -1653,14 +1653,6 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
 
     reinitialized = SynchronizeWithAllInterrupts(DeviceExtension, SynchronizedResetRoutine, &resetContext);
 
-    if (resetContext.TmfDropped)
-    {
-        /* DeviceReset paused the adapter until its TMF completed, and that completion was
-         * discarded with the old control queue, so resume on its behalf.
-         */
-        StorPortResume(DeviceExtension);
-    }
-
     while (!IsListEmpty(&resetContext.PendingSrbs))
     {
         PLIST_ENTRY entry = RemoveHeadList(&resetContext.PendingSrbs);
@@ -1674,21 +1666,33 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
         }
     }
 
-    if (!reinitialized)
+    if (reinitialized)
+    {
+        UnfenceQueues(DeviceExtension, resetContext.NumQueues);
+    }
+    else
     {
         /* The virtqueues are gone, so leave the queues fenced and the reset claimed to keep
          * everything off them. bRemoved fails all further I/O with SRB_STATUS_NO_DEVICE.
          */
         RhelDbgPrint(TRACE_LEVEL_FATAL, " Cannot reinitialize HW on reset\n");
         LogError(DeviceExtension, SP_INTERNAL_ADAPTER_ERROR, __LINE__);
-        StorPortResume(DeviceExtension);
-        EXIT_FN();
-        return;
     }
 
-    UnfenceQueues(DeviceExtension, resetContext.NumQueues);
+    if (resetContext.TmfDropped)
+    {
+        /* DeviceReset paused the adapter until its TMF completed, and that completion was
+         * discarded with the old control queue, so resume on its behalf. Done only once the
+         * queues are unfenced in case Storport doesn't nest pauses.
+         */
+        StorPortResume(DeviceExtension);
+    }
     StorPortResume(DeviceExtension);
-    InterlockedExchange(&adaptExt->reset_in_progress, FALSE);
+
+    if (reinitialized)
+    {
+        InterlockedExchange(&adaptExt->reset_in_progress, FALSE);
+    }
     EXIT_FN();
 }
 
