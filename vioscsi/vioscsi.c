@@ -1605,6 +1605,10 @@ static BOOLEAN SynchronizedResetRoutine(IN PVOID DeviceExtension, IN PVOID Conte
     reinitialized = VioScsiHwReinitialize(DeviceExtension);
     if (!reinitialized)
     {
+        /* virtio_find_queues tears down the queues it set up when a later one fails, but
+         * leaves their pointers in adaptExt->vq, so clear them for SynchronizedTMFRoutine.
+         */
+        DeleteVirtQueues(DeviceExtension);
         /* Set before the interrupt lock is dropped so the ISRs never see the half
          * initialized device.
          */
