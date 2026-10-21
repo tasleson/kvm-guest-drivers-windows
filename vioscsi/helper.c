@@ -402,7 +402,9 @@ InitVirtIODevice(IN PVOID DeviceExtension)
     status = virtio_device_initialize(&adaptExt->vdev, &VioScsiSystemOps, adaptExt, adaptExt->msix_enabled);
     if (!NT_SUCCESS(status))
     {
-        LogError(adaptExt, SP_INTERNAL_ADAPTER_ERROR, __LINE__);
+        /* No LogError here, this also runs at DIRQL on restart where
+         * StorPortLogSystemEvent can't be called. Callers at or below DISPATCH_LEVEL log it.
+         */
         RhelDbgPrint(TRACE_LEVEL_FATAL, " Failed to initialize virtio device, error %x\n", status);
         return FALSE;
     }
@@ -512,6 +514,7 @@ InitHW(IN PVOID DeviceExtension, IN PPORT_CONFIGURATION_INFORMATION ConfigInfo)
     /* initialize the virtual device */
     if (!InitVirtIODevice(DeviceExtension))
     {
+        LogError(DeviceExtension, SP_INTERNAL_ADAPTER_ERROR, __LINE__);
         return FALSE;
     }
 
