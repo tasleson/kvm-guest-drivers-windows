@@ -979,9 +979,10 @@ VioScsiInterrupt(IN PVOID DeviceExtension)
                         ASSERT(0);
                         break;
                 }
+                /* Cleared only for an actual TMF response, the ISR also runs for other queues. */
+                adaptExt->tmf_infly = FALSE;
                 StorPortResume(DeviceExtension);
             }
-            adaptExt->tmf_infly = FALSE;
         }
         while ((evtNode = (PVirtIOSCSIEventNode)virtqueue_get_buf(adaptExt->vq[VIRTIO_SCSI_EVENTS_QUEUE], &len)) !=
                NULL)
@@ -1063,9 +1064,10 @@ static BOOLEAN VioScsiMSInterruptWorker(IN PVOID DeviceExtension, IN ULONG Messa
                         ASSERT(0);
                         break;
                 }
+                /* Cleared only for an actual TMF response, the ISR also runs for other queues. */
+                adaptExt->tmf_infly = FALSE;
                 StorPortResume(DeviceExtension);
             }
-            adaptExt->tmf_infly = FALSE;
         }
         return TRUE;
     }
