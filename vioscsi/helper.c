@@ -247,7 +247,15 @@ DeviceReset(IN PVOID DeviceExtension)
     {
         return TRUE;
     }
-    ASSERT(adaptExt->tmf_infly == FALSE);
+    if (adaptExt->tmf_infly)
+    {
+        /* The device never answered the previous TMF. Don't reuse tmf_cmd while it is
+         * still on the control queue, fail the reset and let Storport escalate.
+         */
+        RhelDbgPrint(TRACE_LEVEL_FATAL, " Previous TMF still in flight, failing reset\n");
+        EXIT_ERR();
+        return FALSE;
+    }
     Srb->SrbExtension = srbExt;
     RtlZeroMemory((PVOID)cmd, sizeof(VirtIOSCSICmd));
     cmd->srb = (PVOID)Srb;
