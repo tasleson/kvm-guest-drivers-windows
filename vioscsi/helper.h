@@ -109,6 +109,8 @@ SendTMF(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
 BOOLEAN
 SynchronizeWithAllInterrupts(IN PVOID DeviceExtension, IN PSTOR_SYNCHRONIZED_ACCESS Routine, IN PVOID Context);
 
+VOID DeleteVirtQueues(IN PVOID DeviceExtension);
+
 VOID ShutDown(IN PVOID DeviceExtension);
 
 BOOLEAN

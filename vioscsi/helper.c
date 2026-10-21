@@ -74,15 +74,6 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         return;
     }
 
-    if (adaptExt->reset_in_progress)
-    {
-        RhelDbgPrint(TRACE_LEVEL_FATAL, " Reset is in progress, completing SRB 0x%p with SRB_STATUS_BUS_RESET.\n", Srb);
-        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
-        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUS_RESET);
-        CompleteRequest(DeviceExtension, Srb);
-        return;
-    }
-
     LOG_SRB_INFO();
 
     if (adaptExt->num_queues > 1)
@@ -122,6 +113,16 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     VioScsiVQLock(DeviceExtension, MessageId, &LockHandle, FALSE);
 
     element = &adaptExt->processing_srbs[vq_req_idx];
+
+    if (element->fenced)
+    {
+        VioScsiVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
+        RhelDbgPrint(TRACE_LEVEL_FATAL, " Reset is in progress, completing SRB 0x%p with SRB_STATUS_BUS_RESET.\n", Srb);
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUS_RESET);
+        CompleteRequest(DeviceExtension, Srb);
+        return;
+    }
 
     ULONG_PTR id = element->next_id;
 
@@ -167,10 +168,18 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                      Srb->TimeOutValue);
         CompleteRequest(DeviceExtension, Srb);
     }
+    if (notify)
+    {
+        /* The kick is done outside the queue lock, so tell a concurrent reset to wait for it
+         * before tearing the virtqueue down.
+         */
+        InterlockedIncrement(&element->notify_inflight);
+    }
     VioScsiVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
     if (notify)
     {
         virtqueue_notify(adaptExt->vq[QueueNumber]);
+        InterlockedDecrement(&element->notify_inflight);
     }
 
     EXIT_FN_SRB();
@@ -186,6 +195,12 @@ SynchronizedTMFRoutine(IN PVOID DeviceExtension, IN PVOID Context)
     ULONGLONG pa;
 
     ENTER_FN();
+    if (adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE] == NULL)
+    {
+        /* A failed reset left the device without virtqueues. */
+        EXIT_ERR();
+        return FALSE;
+    }
     SET_VA_PA();
     if (virtqueue_add_buf(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE],
                           srbExt->psgl,
@@ -263,9 +278,23 @@ DeviceReset(IN PVOID DeviceExtension)
     return TRUE;
 }
 
-VOID ShutDown(IN PVOID DeviceExtension)
+VOID DeleteVirtQueues(IN PVOID DeviceExtension)
 {
     ULONG index;
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    ENTER_FN();
+    virtio_delete_queues(&adaptExt->vdev);
+    for (index = VIRTIO_SCSI_CONTROL_QUEUE; index < adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0; ++index)
+    {
+        adaptExt->vq[index] = NULL;
+    }
+
+    virtio_device_shutdown(&adaptExt->vdev);
+    EXIT_FN();
+}
+
+VOID ShutDown(IN PVOID DeviceExtension)
+{
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
     ENTER_FN();
     if (adaptExt->vdev.device == NULL)
@@ -275,13 +304,7 @@ VOID ShutDown(IN PVOID DeviceExtension)
         return;
     }
     virtio_device_reset(&adaptExt->vdev);
-    virtio_delete_queues(&adaptExt->vdev);
-    for (index = VIRTIO_SCSI_CONTROL_QUEUE; index < adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0; ++index)
-    {
-        adaptExt->vq[index] = NULL;
-    }
-
-    virtio_device_shutdown(&adaptExt->vdev);
+    DeleteVirtQueues(DeviceExtension);
     EXIT_FN();
 }
 
@@ -411,7 +434,7 @@ InitVirtIODevice(IN PVOID DeviceExtension)
     status = virtio_device_initialize(&adaptExt->vdev, &VioScsiSystemOps, adaptExt, adaptExt->msix_enabled);
     if (!NT_SUCCESS(status))
     {
-        /* No LogError here, this also runs at DIRQL on restart where
+        /* No LogError here, this also runs at DIRQL on restart and reset where
          * StorPortLogSystemEvent can't be called. Callers at or below DISPATCH_LEVEL log it.
          */
         RhelDbgPrint(TRACE_LEVEL_FATAL, " Failed to initialize virtio device, error %x\n", status);
@@ -572,6 +595,7 @@ BOOLEAN
 SynchronizeWithAllInterrupts(IN PVOID DeviceExtension, IN PSTOR_SYNCHRONIZED_ACCESS Routine, IN PVOID Context)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    /* Snapshot, Routine may reinitialize the adapter and recompute these. */
     ULONG msixVectors = adaptExt->msix_vectors;
     ULONG firstIrql = 0;
     ULONG innerIrql = 0;

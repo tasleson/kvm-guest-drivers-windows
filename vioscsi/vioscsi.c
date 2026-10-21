@@ -1188,6 +1188,21 @@ VioScsiAdapterControl(IN PVOID DeviceExtension, IN SCSI_ADAPTER_CONTROL_TYPE Con
                     RhelDbgPrint(TRACE_LEVEL_FATAL, " Cannot reinitialize HW\n");
                     break;
                 }
+                if (adaptExt->reset_failed)
+                {
+                    /* An earlier reset failed and left the queues fenced. The device is back
+                     * now, and Storport has quiesced the adapter for the restart, so they are
+                     * unfenced without taking the queue locks.
+                     */
+                    RhelDbgPrint(TRACE_LEVEL_FATAL, " Recovered from failed reset\n");
+                    for (ULONG index = 0; index < ARRAYSIZE(adaptExt->processing_srbs); index++)
+                    {
+                        adaptExt->processing_srbs[index].fenced = FALSE;
+                    }
+                    adaptExt->reset_failed = FALSE;
+                    adaptExt->bRemoved = FALSE;
+                    InterlockedExchange(&adaptExt->reset_in_progress, FALSE);
+                }
                 status = ScsiAdapterControlSuccess;
                 break;
             }
@@ -1446,9 +1461,18 @@ VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr)
     }
 
     PREQUEST_LIST element = &adaptExt->processing_srbs[index - VIRTIO_SCSI_REQUEST_QUEUE_0];
-    vq = adaptExt->vq[index];
 
     VioScsiVQLock(DeviceExtension, MessageID, &queueLock, isr);
+
+    if (element->fenced)
+    {
+        RhelDbgPrint(TRACE_LEVEL_ERROR, "ProcessQueue RESET ALREADY IN PROGRESS !!!!\n");
+        VioScsiVQUnlock(DeviceExtension, MessageID, &queueLock, isr);
+        EXIT_FN();
+        return;
+    }
+
+    vq = adaptExt->vq[index];
 
     do
     {
@@ -1497,57 +1521,168 @@ VOID VioScsiCompleteDpcRoutine(IN PSTOR_DPC Dpc, IN PVOID Context, IN PVOID Syst
     EXIT_FN();
 }
 
+static VOID FenceQueues(IN PVOID DeviceExtension, IN ULONG NumQueues)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+
+    for (ULONG index = 0; index < NumQueues; index++)
+    {
+        PREQUEST_LIST element = &adaptExt->processing_srbs[index];
+        STOR_LOCK_HANDLE LockHandle = {0};
+        ULONG MsgId = QUEUE_TO_MESSAGE(index + VIRTIO_SCSI_REQUEST_QUEUE_0);
+
+        VioScsiVQLock(DeviceExtension, MsgId, &LockHandle, FALSE);
+        element->fenced = TRUE;
+        VioScsiVQUnlock(DeviceExtension, MsgId, &LockHandle, FALSE);
+
+        /* SendSRB kicks the device after dropping the queue lock, wait for any such
+         * kick to finish before the virtqueue is torn down.
+         */
+        while (InterlockedCompareExchange(&element->notify_inflight, 0, 0) != 0)
+        {
+            YieldProcessor();
+        }
+    }
+}
+
+static VOID UnfenceQueues(IN PVOID DeviceExtension, IN ULONG NumQueues)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+
+    for (ULONG index = 0; index < NumQueues; index++)
+    {
+        STOR_LOCK_HANDLE LockHandle = {0};
+        ULONG MsgId = QUEUE_TO_MESSAGE(index + VIRTIO_SCSI_REQUEST_QUEUE_0);
+
+        VioScsiVQLock(DeviceExtension, MsgId, &LockHandle, FALSE);
+        adaptExt->processing_srbs[index].fenced = FALSE;
+        VioScsiVQUnlock(DeviceExtension, MsgId, &LockHandle, FALSE);
+    }
+}
+
+typedef struct _RESET_CONTEXT
+{
+    ULONG NumQueues;
+    LIST_ENTRY PendingSrbs;
+    BOOLEAN TmfDropped;
+} RESET_CONTEXT, *PRESET_CONTEXT;
+
+static BOOLEAN SynchronizedResetRoutine(IN PVOID DeviceExtension, IN PVOID Context)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    PRESET_CONTEXT resetContext = (PRESET_CONTEXT)Context;
+    BOOLEAN reinitialized;
+
+    ENTER_FN();
+
+    /* Running with the interrupt locks held keeps the ISRs off the virtqueues while they
+     * are torn down and recreated. The DPC and StartIo paths are already locked out by
+     * the per-queue fences, so the request lists are walked without taking the queue
+     * locks, which can't be acquired at this IRQL anyway.
+     */
+    DeleteVirtQueues(DeviceExtension);
+    resetContext->TmfDropped = adaptExt->tmf_infly;
+    adaptExt->tmf_infly = FALSE;
+
+    /* The SRBs are only collected here, completing them runs PostProcessRequest which may
+     * allocate pool and so must happen at DISPATCH_LEVEL once the interrupt lock is dropped.
+     * This has to be done before VioScsiHwReinitialize reinitializes the lists.
+     */
+    for (ULONG index = 0; index < resetContext->NumQueues; index++)
+    {
+        PREQUEST_LIST element = &adaptExt->processing_srbs[index];
+        RhelDbgPrint(TRACE_LEVEL_FATAL, " queue %d cnt %d\n", index, element->srb_cnt);
+        while (!IsListEmpty(&element->srb_list))
+        {
+            InsertTailList(&resetContext->PendingSrbs, RemoveHeadList(&element->srb_list));
+        }
+        element->srb_cnt = 0;
+    }
+
+    reinitialized = VioScsiHwReinitialize(DeviceExtension);
+    if (!reinitialized)
+    {
+        /* Set before the interrupt lock is dropped so the ISRs never see the half
+         * initialized device.
+         */
+        adaptExt->bRemoved = TRUE;
+        adaptExt->reset_failed = TRUE;
+    }
+
+    EXIT_FN();
+    return reinitialized;
+}
+
 VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
 {
-    PADAPTER_EXTENSION adaptExt;
-    ULONG QueueNum;
-    ULONG MsgId;
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    RESET_CONTEXT resetContext = {0};
+    BOOLEAN reinitialized;
 
-    adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    ENTER_FN();
 
-    if (!adaptExt->reset_in_progress)
-    {
-        adaptExt->reset_in_progress = TRUE;
-        StorPortPause(DeviceExtension, 10);
-        DeviceReset(DeviceExtension);
-
-        for (ULONG index = 0; index < adaptExt->num_queues; index++)
-        {
-            PREQUEST_LIST element = &adaptExt->processing_srbs[index];
-            STOR_LOCK_HANDLE LockHandle = {0};
-            RhelDbgPrint(TRACE_LEVEL_FATAL, " queue %d cnt %d\n", index, element->srb_cnt);
-            QueueNum = index + VIRTIO_SCSI_REQUEST_QUEUE_0;
-            MsgId = QUEUE_TO_MESSAGE(QueueNum);
-            VioScsiVQLock(DeviceExtension, MsgId, &LockHandle, FALSE);
-            while (!IsListEmpty(&element->srb_list))
-            {
-                PLIST_ENTRY entry = RemoveHeadList(&element->srb_list);
-                if (entry)
-                {
-                    PSRB_EXTENSION currSrbExt = CONTAINING_RECORD(entry, SRB_EXTENSION, list_entry);
-                    PSCSI_REQUEST_BLOCK currSrb = currSrbExt->Srb;
-                    if (currSrb)
-                    {
-                        SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_BUS_RESET);
-                        SRB_SET_DATA_TRANSFER_LENGTH(currSrb, 0);
-                        CompleteRequest(DeviceExtension, (PSRB_TYPE)currSrb);
-                        element->srb_cnt--;
-                    }
-                }
-            }
-            if (element->srb_cnt)
-            {
-                element->srb_cnt = 0;
-            }
-            VioScsiVQUnlock(DeviceExtension, MsgId, &LockHandle, FALSE);
-        }
-        StorPortResume(DeviceExtension);
-    }
-    else
+    if (InterlockedCompareExchange(&adaptExt->reset_in_progress, TRUE, FALSE) != FALSE)
     {
         RhelDbgPrint(TRACE_LEVEL_FATAL, " Reset is already in progress, doing nothing.\n");
+        EXIT_FN();
+        return;
     }
-    adaptExt->reset_in_progress = FALSE;
+
+    /* VioScsiHwInitialize may recompute num_queues, use the same count to fence and
+     * unfence the queues.
+     */
+    resetContext.NumQueues = adaptExt->num_queues;
+    InitializeListHead(&resetContext.PendingSrbs);
+
+    StorPortPause(DeviceExtension, 10);
+    FenceQueues(DeviceExtension, resetContext.NumQueues);
+
+    /* Once the reset returns the device has dropped every request and does no more DMA,
+     * so the SRBs can be handed back. It is done before taking the interrupt locks since
+     * the host may take a while to cancel the outstanding I/O. Any ISR that runs in the
+     * meantime only finds the old rings, which stay mapped until they are torn down.
+     */
+    virtio_device_reset(&adaptExt->vdev);
+
+    reinitialized = SynchronizeWithAllInterrupts(DeviceExtension, SynchronizedResetRoutine, &resetContext);
+
+    if (resetContext.TmfDropped)
+    {
+        /* DeviceReset paused the adapter until its TMF completed, and that completion was
+         * discarded with the old control queue, so resume on its behalf.
+         */
+        StorPortResume(DeviceExtension);
+    }
+
+    while (!IsListEmpty(&resetContext.PendingSrbs))
+    {
+        PLIST_ENTRY entry = RemoveHeadList(&resetContext.PendingSrbs);
+        PSRB_EXTENSION currSrbExt = CONTAINING_RECORD(entry, SRB_EXTENSION, list_entry);
+        PSCSI_REQUEST_BLOCK currSrb = currSrbExt->Srb;
+        if (currSrb)
+        {
+            SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_BUS_RESET);
+            SRB_SET_DATA_TRANSFER_LENGTH(currSrb, 0);
+            CompleteRequest(DeviceExtension, (PSRB_TYPE)currSrb);
+        }
+    }
+
+    if (!reinitialized)
+    {
+        /* The virtqueues are gone, so leave the queues fenced and the reset claimed to keep
+         * everything off them. bRemoved fails all further I/O with SRB_STATUS_NO_DEVICE.
+         */
+        RhelDbgPrint(TRACE_LEVEL_FATAL, " Cannot reinitialize HW on reset\n");
+        LogError(DeviceExtension, SP_INTERNAL_ADAPTER_ERROR, __LINE__);
+        StorPortResume(DeviceExtension);
+        EXIT_FN();
+        return;
+    }
+
+    UnfenceQueues(DeviceExtension, resetContext.NumQueues);
+    StorPortResume(DeviceExtension);
+    InterlockedExchange(&adaptExt->reset_in_progress, FALSE);
+    EXIT_FN();
 }
 
 UCHAR

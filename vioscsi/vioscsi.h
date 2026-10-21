@@ -277,6 +277,8 @@ typedef struct _REQUEST_LIST
     LIST_ENTRY srb_list;
     ULONG srb_cnt;
     ULONG_PTR next_id;
+    BOOLEAN fenced;
+    volatile LONG notify_inflight;
 } REQUEST_LIST, *PREQUEST_LIST;
 
 typedef struct virtio_bar
@@ -349,7 +351,8 @@ typedef struct _ADAPTER_EXTENSION
     UCHAR ven_id[8 + 1];
     UCHAR prod_id[16 + 1];
     UCHAR rev_id[4 + 1];
-    BOOLEAN reset_in_progress;
+    volatile LONG reset_in_progress;
+    BOOLEAN reset_failed;
     ACTION_ON_RESET action_on_reset;
     ULONGLONG fw_ver;
     ULONG resp_time;
