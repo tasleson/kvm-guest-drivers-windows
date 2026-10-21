@@ -1268,7 +1268,10 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
                 QueuNum = index + VIRTIO_SCSI_REQUEST_QUEUE_0;
                 MsgId = QUEUE_TO_MESSAGE(QueuNum);
                 VioScsiVQLock(DeviceExtension, MsgId, &LockHandle, FALSE);
-                if (!IsListEmpty(&element->srb_list))
+                /* A fenced queue belongs to a reset, which walks srb_list without this lock
+                 * and completes every SRB on it.
+                 */
+                if (!element->fenced && !IsListEmpty(&element->srb_list))
                 {
                     PLIST_ENTRY entry = element->srb_list.Flink;
                     while (entry != &element->srb_list)
