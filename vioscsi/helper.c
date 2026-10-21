@@ -196,6 +196,10 @@ SynchronizedTMFRoutine(IN PVOID DeviceExtension, IN PVOID Context)
                           pa) >= 0)
     {
         virtqueue_kick(adaptExt->vq[VIRTIO_SCSI_CONTROL_QUEUE]);
+        /* Set while the interrupt locks are held so neither the ISR nor a reset can miss
+         * the TMF in flight.
+         */
+        adaptExt->tmf_infly = TRUE;
         EXIT_FN();
         return TRUE;
     }
@@ -209,7 +213,7 @@ BOOLEAN
 SendTMF(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 {
     ENTER_FN();
-    return StorPortSynchronizeAccess(DeviceExtension, SynchronizedTMFRoutine, (PVOID)Srb);
+    return SynchronizeWithAllInterrupts(DeviceExtension, SynchronizedTMFRoutine, (PVOID)Srb);
     EXIT_FN();
 }
 
@@ -256,7 +260,6 @@ DeviceReset(IN PVOID DeviceExtension)
         StorPortResume(DeviceExtension);
         return FALSE;
     }
-    adaptExt->tmf_infly = TRUE;
     return TRUE;
 }
 
@@ -560,6 +563,43 @@ KickEvent(IN PVOID DeviceExtension, IN PVirtIOSCSIEventNode EventNode)
     EventNode->sg.length = sizeof(VirtIOSCSIEvent);
     return SynchronizedKickEventRoutine(DeviceExtension, (PVOID)EventNode);
     EXIT_FN();
+}
+
+/* With InterruptSynchronizePerMessage StorPortSynchronizeAccess doesn't exclude the ISRs of
+ * every MSI-X message, so take each message's lock to run Routine with no ISR active.
+ */
+BOOLEAN
+SynchronizeWithAllInterrupts(IN PVOID DeviceExtension, IN PSTOR_SYNCHRONIZED_ACCESS Routine, IN PVOID Context)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    ULONG msixVectors = adaptExt->msix_vectors;
+    ULONG firstIrql = 0;
+    ULONG innerIrql = 0;
+    BOOLEAN result;
+
+    if (!adaptExt->msix_enabled || msixVectors == 0)
+    {
+        return StorPortSynchronizeAccess(DeviceExtension, Routine, Context);
+    }
+
+    /* All message interrupts are connected with one SynchronizeIrql, so only the first
+     * acquisition raises the IRQL and every later one reports that same IRQL as its old one.
+     */
+    StorPortAcquireMSISpinLock(DeviceExtension, 0, &firstIrql);
+    for (ULONG MessageId = 1; MessageId < msixVectors; MessageId++)
+    {
+        StorPortAcquireMSISpinLock(DeviceExtension, MessageId, &innerIrql);
+    }
+
+    result = Routine(DeviceExtension, Context);
+
+    for (ULONG MessageId = msixVectors - 1; MessageId > 0; MessageId--)
+    {
+        StorPortReleaseMSISpinLock(DeviceExtension, MessageId, innerIrql);
+    }
+    StorPortReleaseMSISpinLock(DeviceExtension, 0, firstIrql);
+
+    return result;
 }
 
 VOID VioScsiVQLock(IN PVOID DeviceExtension, IN ULONG MessageID, IN OUT PSTOR_LOCK_HANDLE LockHandle, IN BOOLEAN isr)
