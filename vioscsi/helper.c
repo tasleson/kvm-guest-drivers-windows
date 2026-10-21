@@ -265,6 +265,12 @@ VOID ShutDown(IN PVOID DeviceExtension)
     ULONG index;
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
     ENTER_FN();
+    if (adaptExt->vdev.device == NULL)
+    {
+        /* A failed (re)initialization never got as far as setting up the device. */
+        EXIT_FN();
+        return;
+    }
     virtio_device_reset(&adaptExt->vdev);
     virtio_delete_queues(&adaptExt->vdev);
     for (index = VIRTIO_SCSI_CONTROL_QUEUE; index < adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0; ++index)
