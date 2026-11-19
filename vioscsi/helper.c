@@ -66,24 +66,19 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         return;
     }
 
-    if (adaptExt->bRemoved)
+    // This needs to happen before we call CompleteRequest, as that function retrieves the
+    // srb extension and does an unconditional dereference.
+    srbExt = SRB_EXTENSION(Srb);
+
+    // This check should not be needed, as the StorPortInitialize should have failed otherwise.
+    // The problem with this check, is if it's true for some unknown reason, the srb is lost.
+    // if we want to keep this path, we should change CompleteRequest to handle a SRB that
+    // doesn't have a srb extension.
+    if (!srbExt)
     {
-        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_NO_DEVICE);
-        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
-        CompleteRequest(DeviceExtension, Srb);
+        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " No SRB Extenstion for SRB 0x%p \n", Srb);
         return;
     }
-
-    if (adaptExt->reset_in_progress)
-    {
-        RhelDbgPrint(TRACE_LEVEL_FATAL, " Reset is in progress, completing SRB 0x%p with SRB_STATUS_BUS_RESET.\n", Srb);
-        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
-        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUS_RESET);
-        CompleteRequest(DeviceExtension, Srb);
-        return;
-    }
-
-    LOG_SRB_INFO();
 
     if (adaptExt->num_queues > 1)
     {
@@ -108,16 +103,33 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         }
     }
 
-    srbExt = SRB_EXTENSION(Srb);
+    vq_req_idx = QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0;
+    srbExt->QueueIndex = vq_req_idx;
 
-    if (!srbExt)
+    // QueueIndex must be stamped before the bRemoved/reset_in_progress early-outs below,
+    // since both complete the SRB via CompleteRequest(), which attributes per-queue stats
+    // using this field. Doing it after would leave QueueIndex at its zeroed (queue 0)
+    // default from VioScsiBuildIo, misattributing those completions to queue 0.
+    if (adaptExt->bRemoved)
     {
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " No SRB Extenstion for SRB 0x%p \n", Srb);
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_NO_DEVICE);
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        CompleteRequest(DeviceExtension, Srb);
         return;
     }
 
+    if (adaptExt->reset_in_progress)
+    {
+        RhelDbgPrint(TRACE_LEVEL_FATAL, " Reset is in progress, completing SRB 0x%p with SRB_STATUS_BUS_RESET.\n", Srb);
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUS_RESET);
+        CompleteRequest(DeviceExtension, Srb);
+        return;
+    }
+
+    LOG_SRB_INFO();
+
     MessageId = QUEUE_TO_MESSAGE(QueueNumber);
-    vq_req_idx = QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0;
 
     VioScsiVQLock(DeviceExtension, MessageId, &LockHandle, FALSE);
 
@@ -144,11 +156,21 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
 
     if (add_buffer_req_status == VQ_ADD_BUFFER_SUCCESS)
     {
+        PQUEUE_TELEMETRY queueStats = StorPerfQueue(adaptExt->Telemetry, vq_req_idx);
+
         notify = virtqueue_kick_prepare(adaptExt->vq[QueueNumber]);
         element = &adaptExt->processing_srbs[vq_req_idx];
+        srbExt->SubmitTime = StorPerfInterruptTime(adaptExt);
         InsertTailList(&element->srb_list, &srbExt->list_entry);
         element->srb_cnt++;
         InterlockedIncrement64(&adaptExt->diagCounters.srbs_sent);
+        StorPerfSyncInFlight(queueStats, element);
+        StorPerfTargetSubmitted(adaptExt->Telemetry, srbExt);
+        // Called under VioScsiVQLock for this queue, so a plain compare/update is safe.
+        if (queueStats != NULL && element->srb_cnt > queueStats->InFlightHighWaterMark)
+        {
+            queueStats->InFlightHighWaterMark = element->srb_cnt;
+        }
     }
     else
     {
@@ -158,6 +180,12 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
         SRB_SET_SRB_STATUS(Srb, SRB_STATUS_BUSY);
         SRB_SET_SCSI_STATUS(Srb, ScsiStatus);
         StorPortBusy(DeviceExtension, 10);
+        PQUEUE_TELEMETRY fullStats = StorPerfQueue(adaptExt->Telemetry, vq_req_idx);
+
+        if (fullStats != NULL)
+        {
+            fullStats->QueueFullCount++;
+        }
         RhelDbgPrint(TRACE_LEVEL_WARNING,
                      " Could not put an SRB into a VQ due to error %s (%i). To be completed with SRB_STATUS_BUSY. "
                      "QueueNumber = %lu, SRB = 0x%p, Lun = %d, TimeOut = %d.\n",
@@ -230,7 +258,18 @@ DeviceReset(IN PVOID DeviceExtension)
     {
         return TRUE;
     }
+    // adaptExt->tmf_cmd/srbExt is a single shared per-adapter structure, not per-request.
+    // If a second TMF were built here while one is already in flight, this overwrites the
+    // in-flight command's SRB/SG state out from under it, so when it eventually completes,
+    // the driver acts on the wrong request's data. DeviceReset should be unreachable while a
+    // prior TMF is in flight under correct operation (Storport serializes reset handling);
+    // this path is being hit in practice, so count occurrences in telemetry to measure how
+    // often it happens rather than just asserting.
     ASSERT(adaptExt->tmf_infly == FALSE);
+    if (adaptExt->tmf_infly && adaptExt->Telemetry != NULL)
+    {
+        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry->DeviceResetTmfInFlightCount);
+    }
     Srb->SrbExtension = srbExt;
     RtlZeroMemory((PVOID)cmd, sizeof(VirtIOSCSICmd));
     cmd->srb = (PVOID)Srb;

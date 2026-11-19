@@ -130,4 +130,58 @@ typedef struct _VioScsiDiag
 
 #define VioScsiDiag_SIZE (FIELD_OFFSET(VioScsiDiag, UnmatchedCompletions) + VioScsiDiag_UnmatchedCompletions_SIZE)
 
+// VioScsiTelemetryGuid - VioScsiTelemetry
+// VirtIO SCSI Telemetry (chunked read of the live STOR_TELEMETRY block)
+#define VioScsiWmi_Telemetry_Guid                                                                                       \
+    {                                                                                                                  \
+        0x5166c0a0, 0x213b, 0x45de,                                                                                    \
+        {                                                                                                              \
+            0x98, 0x22, 0xaf, 0xd4, 0x18, 0xc7, 0x0c, 0xef                                                             \
+        }                                                                                                              \
+    }
+
+#if !(defined(MIDL_PASS))
+DEFINE_GUID(VioScsiTelemetryGuid_GUID, 0x5166c0a0, 0x213b, 0x45de, 0x98, 0x22, 0xaf, 0xd4, 0x18, 0xc7, 0x0c, 0xef);
+#endif
+
+// One GetChunk call copies at most this many bytes out of the telemetry block.
+#define VIOSCSI_TELEMETRY_MAX_CHUNK 4096
+
+typedef struct _VioScsiTelemetryChunk_IN
+{
+    //
+    ULONG Offset;
+#define VioScsiTelemetryChunk_IN_Offset_SIZE sizeof(ULONG)
+#define VioScsiTelemetryChunk_IN_Offset_ID   1
+
+    //
+    ULONG Length;
+#define VioScsiTelemetryChunk_IN_Length_SIZE sizeof(ULONG)
+#define VioScsiTelemetryChunk_IN_Length_ID   2
+} VioScsiTelemetryChunk_IN, *PVioScsiTelemetryChunk_IN;
+
+#define VioScsiTelemetryChunk_IN_SIZE (FIELD_OFFSET(VioScsiTelemetryChunk_IN, Length) + VioScsiTelemetryChunk_IN_Length_SIZE)
+
+typedef struct _VioScsiTelemetryChunk_OUT
+{
+    //
+    ULONG TotalSize;
+#define VioScsiTelemetryChunk_OUT_TotalSize_SIZE sizeof(ULONG)
+#define VioScsiTelemetryChunk_OUT_TotalSize_ID   1
+
+    //
+    ULONG ChunkLength;
+#define VioScsiTelemetryChunk_OUT_ChunkLength_SIZE sizeof(ULONG)
+#define VioScsiTelemetryChunk_OUT_ChunkLength_ID   2
+
+    //
+    UCHAR Data[VIOSCSI_TELEMETRY_MAX_CHUNK];
+#define VioScsiTelemetryChunk_OUT_Data_SIZE VIOSCSI_TELEMETRY_MAX_CHUNK
+#define VioScsiTelemetryChunk_OUT_Data_ID   3
+} VioScsiTelemetryChunk_OUT, *PVioScsiTelemetryChunk_OUT;
+
+// Only the first ChunkLength bytes of Data are returned; WmiSizeIs("ChunkLength") in the MOF.
+#define VioScsiTelemetryChunk_OUT_SIZE(ChunkLength)                                                                      \
+    (FIELD_OFFSET(VioScsiTelemetryChunk_OUT, Data) + (ChunkLength))
+
 #endif

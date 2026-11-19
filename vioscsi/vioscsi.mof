@@ -65,3 +65,25 @@ class VioScsiDiagGuid
     [read, WmiDataId(7), WmiVersion(1),
      Description("Completed virtqueue buffers not matched to any pending SRB")] uint32 UnmatchedCompletions;
 };
+
+[
+    Dynamic, Provider("WMIProv"),
+    WMI,
+    Description("VirtIO SCSI Telemetry"),
+    guid("{5166C0A0-213B-45DE-9822-AFD418C70CEF}"),
+    HeaderName("VioScsiTelemetry"),
+    GuidName1("VioScsiWmi_Telemetry_Guid"),
+    WmiExpense(0)
+]
+class VioScsiTelemetryGuid
+{
+    [read, key] String InstanceName;
+    [read] boolean Active;
+
+    [WmiMethodId(1), Implemented, Description("Read a chunk of the driver's live STOR_TELEMETRY block; call with Offset=0 first (this refreshes SnapshotTime and per-target OldestInFlightTime)")]
+    void GetChunk([in, Description("Byte offset into the telemetry block")] uint32 Offset,
+                  [in, Description("Requested chunk length, clamped to 4096")] uint32 Length,
+                  [out, Description("sizeof of the full telemetry block")] uint32 TotalSize,
+                  [out, Description("Bytes actually returned in Data, 0 at/past end")] uint32 ChunkLength,
+                  [out, WmiSizeIs("ChunkLength"), Max(4096)] uint8 Data[]);
+};

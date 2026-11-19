@@ -53,8 +53,25 @@
 #define VIOSCSI_MS_ADAPTER_INFORM_GUID_INDEX 1
 #define VIOSCSI_MS_PORT_INFORM_GUID_INDEX    2
 #define VIOSCSI_DIAG_GUID_INDEX              3
+#define VIOSCSI_TELEMETRY_GUID_INDEX         4
+
+// Method ids for VIOSCSI_TELEMETRY_GUID_INDEX.
+#define VIOSCSI_TELEMETRY_METHOD_GETCHUNK    1
 
 BOOLEAN IsCrashDumpMode;
+// Statically initialized so it sits in the image's .data with the magic already in place.
+// clang-format off
+VIOSCSI_TELEMETRY_DIRECTORY VioScsiTelemetryDirectory =
+{
+    VIOSCSI_TELEMETRY_DIRECTORY_MAGIC,          // Magic
+    VIOSCSI_TELEMETRY_DIRECTORY_VERSION,        // Version
+    sizeof(PVOID),                              // PointerSize
+    VIOSCSI_MAX_TELEMETRY_ADAPTERS,             // MaxAdapters
+    FIELD_OFFSET(ADAPTER_EXTENSION, Telemetry), // TelemetryOffset
+    0,                                          // Reserved
+    { NULL },                                   // Adapters
+};
+// clang-format on
 
 sp_DRIVER_INITIALIZE DriverEntry;
 HW_INITIALIZE VioScsiHwInitialize;
@@ -168,6 +185,7 @@ GUID VioScsiWmiExtendedInfoGuid = VioScsiWmi_ExtendedInfo_Guid;
 GUID VioScsiWmiAdapterInformationQueryGuid = MS_SM_AdapterInformationQueryGuid;
 GUID VioScsiWmiPortInformationMethodsGuid = MS_SM_PortInformationMethodsGuid;
 GUID VioScsiWmiDiagGuid = VioScsiWmi_Diag_Guid;
+GUID VioScsiWmiTelemetryGuid = VioScsiWmi_Telemetry_Guid;
 
 // clang-format off
 SCSIWMIGUIDREGINFO VioScsiGuidList[] =
@@ -176,6 +194,7 @@ SCSIWMIGUIDREGINFO VioScsiGuidList[] =
    { &VioScsiWmiAdapterInformationQueryGuid, 1, 0 },
    { &VioScsiWmiPortInformationMethodsGuid,  1, 0 },
    { &VioScsiWmiDiagGuid,                    1, 0 },
+   { &VioScsiWmiTelemetryGuid,               1, 0 },
 };
 // clang-format on
 
@@ -536,6 +555,10 @@ VioScsiFindAdapter(IN PVOID DeviceExtension,
         adaptExt->poolAllocationSize += ROUND_TO_CACHE_LINES(sizeof(SRB_EXTENSION));
         adaptExt->poolAllocationSize += ROUND_TO_CACHE_LINES(sizeof(VirtIOSCSIEventNode) * 8);
         adaptExt->poolAllocationSize += ROUND_TO_CACHE_LINES(sizeof(STOR_DPC) * max_queues);
+        // Carved last in VioScsiHwInitialize, once. Only the normal instance gets telemetry, the
+        // crash dump one has no use for it.
+        adaptExt->telemetry_queue_capacity = max_queues;
+        adaptExt->poolAllocationSize += ROUND_TO_CACHE_LINES(STOR_TELEMETRY_SIZE(max_queues));
     }
     if (max_queues + VIRTIO_SCSI_REQUEST_QUEUE_0 > MAX_QUEUES_PER_DEVICE_DEFAULT)
     {
@@ -664,6 +687,102 @@ VioScsiPoolAlloc(IN PVOID DeviceExtension, IN SIZE_T size)
     return NULL;
 }
 
+// clang-format off
+const UCHAR StorTelemetryStatusCodes[STOR_TELEMETRY_STATUS_SLOTS] = {
+    SRB_STATUS_SUCCESS,
+    SRB_STATUS_PENDING,
+    SRB_STATUS_ABORTED,
+    SRB_STATUS_ERROR,
+    SRB_STATUS_BUSY,
+    SRB_STATUS_INVALID_REQUEST,
+    SRB_STATUS_NO_DEVICE,
+    SRB_STATUS_TIMEOUT,
+    SRB_STATUS_SELECTION_TIMEOUT,
+    SRB_STATUS_COMMAND_TIMEOUT,
+    SRB_STATUS_BUS_RESET,
+    SRB_STATUS_DATA_OVERRUN,
+    SRB_STATUS_BAD_SRB_BLOCK_LENGTH,
+    SRB_STATUS_INVALID_LUN,
+    SRB_STATUS_INVALID_TARGET_ID,
+    STOR_TELEMETRY_STATUS_OTHER,
+};
+// clang-format on
+C_ASSERT(RTL_NUMBER_OF(StorTelemetryStatusCodes) == STOR_TELEMETRY_STATUS_SLOTS);
+
+// Carves and initializes the telemetry block from the adapter's pool. Call once, after the
+// other one-time carves (see VioScsiHwInitialize). Leaves Telemetry NULL if there is no room.
+static VOID TelemetryInit(IN PADAPTER_EXTENSION adaptExt)
+{
+    PSTOR_TELEMETRY telemetry;
+    ULONG capacity = adaptExt->telemetry_queue_capacity;
+    ULONG index;
+
+    telemetry = (PSTOR_TELEMETRY)VioScsiPoolAlloc(adaptExt, STOR_TELEMETRY_SIZE(capacity));
+    if (telemetry == NULL)
+    {
+        RhelDbgPrint(TRACE_LEVEL_ERROR,
+                     " Telemetry disabled, cannot allocate %lu bytes\n",
+                     STOR_TELEMETRY_SIZE(capacity));
+        return;
+    }
+
+    // VioScsiPoolAlloc zeroed the block.
+    telemetry->Magic = STOR_TELEMETRY_MAGIC;
+    telemetry->Version = STOR_TELEMETRY_VERSION;
+    telemetry->HeaderSize = (ULONG)FIELD_OFFSET(STOR_TELEMETRY, Queues);
+    telemetry->QueueSize = (ULONG)sizeof(QUEUE_TELEMETRY);
+    telemetry->QueueCapacity = capacity;
+    telemetry->TargetSize = (ULONG)sizeof(TARGET_TELEMETRY);
+    telemetry->TargetCount = STOR_TELEMETRY_MAX_TARGETS;
+    telemetry->TargetsOffset = STOR_TELEMETRY_TARGETS_OFFSET(capacity);
+    telemetry->LatencyBuckets = STOR_TELEMETRY_HISTOGRAM_BUCKETS;
+    telemetry->StatusSlots = STOR_TELEMETRY_STATUS_SLOTS;
+    RtlCopyMemory(telemetry->StatusCodes, StorTelemetryStatusCodes, sizeof(telemetry->StatusCodes));
+    ASSERT(telemetry->TargetsOffset % sizeof(ULONG64) == 0);
+    for (index = 0; index < STOR_TELEMETRY_MAX_TARGETS; ++index)
+    {
+        StorPerfTarget(telemetry, index)->TargetId = index;
+    }
+    adaptExt->Telemetry = telemetry;
+}
+
+static VOID TelemetryRegisterAdapter(IN PADAPTER_EXTENSION adaptExt)
+{
+    ULONG i;
+
+    if (adaptExt->dump_mode || adaptExt->Telemetry == NULL)
+    {
+        return;
+    }
+    for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
+    {
+        if (VioScsiTelemetryDirectory.Adapters[i] == adaptExt)
+        {
+            return;
+        }
+    }
+    for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
+    {
+        if (InterlockedCompareExchangePointer((PVOID volatile *)&VioScsiTelemetryDirectory.Adapters[i],
+                                              adaptExt,
+                                              NULL) == NULL)
+        {
+            return;
+        }
+    }
+    RhelDbgPrint(TRACE_LEVEL_WARNING, " No free telemetry slot for adapter 0x%p\n", adaptExt);
+}
+
+static VOID TelemetryDeregisterAdapter(IN PADAPTER_EXTENSION adaptExt)
+{
+    ULONG i;
+
+    for (i = 0; i < VIOSCSI_MAX_TELEMETRY_ADAPTERS; ++i)
+    {
+        InterlockedCompareExchangePointer((PVOID volatile *)&VioScsiTelemetryDirectory.Adapters[i], NULL, adaptExt);
+    }
+}
+
 BOOLEAN
 VioScsiHwInitialize(IN PVOID DeviceExtension)
 {
@@ -746,6 +865,30 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
             adaptExt->tmf_cmd.SrbExtension = (PSRB_EXTENSION)VioScsiPoolAlloc(DeviceExtension, sizeof(SRB_EXTENSION));
             adaptExt->events = (PVirtIOSCSIEventNode)VioScsiPoolAlloc(DeviceExtension, sizeof(VirtIOSCSIEventNode) * 8);
             adaptExt->dpc = (PSTOR_DPC)VioScsiPoolAlloc(DeviceExtension, sizeof(STOR_DPC) * adaptExt->num_queues);
+            // Carved after everything above and only here: the virtqueue heaps are re-carved from
+            // poolOffset 0 on every HwInitialize, so this block must sit past them, and being
+            // allocated once its counters survive ScsiRestartAdapter.
+            TelemetryInit(adaptExt);
+        }
+    }
+
+    // num_queues is final here (FindAdapter's value may have been adjusted to the granted MSI-X
+    // vectors above), and HwInitialize also runs on restart, so publish it to telemetry now.
+    // The table may hold fewer queues than num_queues, hence the min().
+    if (adaptExt->Telemetry != NULL)
+    {
+        adaptExt->Telemetry->QueueCount = min((ULONG)adaptExt->num_queues, adaptExt->Telemetry->QueueCapacity);
+        for (index = 0; index < adaptExt->Telemetry->QueueCount; ++index)
+        {
+            StorPerfSyncInFlight(StorPerfQueue(adaptExt->Telemetry, index), &adaptExt->processing_srbs[index]);
+        }
+        // The lists were just emptied, so no request is in flight for any target either.
+        for (index = 0; index < STOR_TELEMETRY_MAX_TARGETS; ++index)
+        {
+            PTARGET_TELEMETRY target = StorPerfTarget(adaptExt->Telemetry, index);
+
+            target->InFlightCount = 0;
+            target->OldestInFlightTime = 0;
         }
     }
 
@@ -839,6 +982,11 @@ VioScsiHwInitialize(IN PVOID DeviceExtension)
             return FALSE;
         }
     }
+
+    // Registered here rather than in FindAdapter: HwInitialize runs on both initial start
+    // and ScsiRestartAdapter, and only after FindAdapter succeeded, so a failed FindAdapter
+    // never leaves a dangling entry. ScsiStopAdapter removes it again.
+    TelemetryRegisterAdapter(adaptExt);
 
     virtio_device_ready(&adaptExt->vdev);
     EXIT_FN();
@@ -1201,6 +1349,7 @@ VioScsiAdapterControl(IN PVOID DeviceExtension, IN SCSI_ADAPTER_CONTROL_TYPE Con
         case ScsiStopAdapter:
             {
                 RhelDbgPrint(TRACE_LEVEL_VERBOSE, " ScsiStopAdapter\n");
+                TelemetryDeregisterAdapter(adaptExt);
                 ShutDown(DeviceExtension);
                 if (adaptExt->pmsg_affinity != NULL)
                 {
@@ -1298,6 +1447,8 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
                         {
                             SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_NO_DEVICE);
                             SRB_SET_DATA_TRANSFER_LENGTH(currSrb, 0);
+                            currSrbExt->SubmitTime = 0; // not a device completion, keep it out of latency stats
+                            StorPerfTargetRemoved(adaptExt->Telemetry, currSrbExt); // before the SRB is handed back
                             CompleteRequest(DeviceExtension, (PSRB_TYPE)currSrb);
                             RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                                          " Complete pending I/Os on Path %d Target %d Lun %d \n",
@@ -1306,6 +1457,7 @@ VioScsiUnitControl(IN PVOID DeviceExtension, IN SCSI_UNIT_CONTROL_TYPE ControlTy
                                          SRB_LUN(currSrb));
                             RemoveEntryList(entry);
                             element->srb_cnt--;
+                            StorPerfSyncInFlight(StorPerfQueue(adaptExt->Telemetry, index), element);
                         }
                         entry = next;
                     }
@@ -1364,6 +1516,30 @@ VioScsiBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
                          Target,
                          Lun);
         }
+
+        // These never reach the SRB extension or CompleteRequest, so count them here (only I/O:
+        // other SRB functions don't address a target). A target ID the device doesn't have goes in
+        // an adapter-wide counter since it isn't a real target; anything else is a refusal for a
+        // target that exists.
+        if (SRB_FUNCTION(Srb) == SRB_FUNCTION_EXECUTE_SCSI)
+        {
+            if (Target > adaptExt->scsi_config.max_target)
+            {
+                if (adaptExt->Telemetry != NULL)
+                {
+                    InterlockedIncrement64((PLONG64)&adaptExt->Telemetry->OutOfRangeTargetCount);
+                }
+            }
+            else
+            {
+                PTARGET_TELEMETRY target = StorPerfTarget(adaptExt->Telemetry, Target);
+
+                if (target != NULL)
+                {
+                    InterlockedIncrement64((PLONG64)&target->NoDeviceCount);
+                }
+            }
+        }
         SRB_SET_SRB_STATUS(Srb, SRB_STATUS_NO_DEVICE);
         SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
         StorPortNotification(RequestComplete, DeviceExtension, Srb);
@@ -1374,6 +1550,7 @@ VioScsiBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     RtlZeroMemory(srbExt, sizeof(*srbExt));
     srbExt->Srb = Srb;
+    srbExt->TargetId = Target;
     srbExt->psgl = srbExt->vio_sg;
     srbExt->pdesc = srbExt->desc_alias;
 
@@ -1433,7 +1610,10 @@ VioScsiBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     }
     srbExt->in = sgElement - srbExt->out;
 
-    if (adaptExt->resp_time)
+    // The SRB extension is reused: clear what a previous request left so a request that never
+    // reaches the virtqueue isn't treated as submitted (see RecordIoCompletionStats).
+    srbExt->time = 0;
+    srbExt->SubmitTime = 0;
     {
         LARGE_INTEGER counter = {0};
         ULONG status = STOR_STATUS_SUCCESS;
@@ -1514,6 +1694,9 @@ VOID ProcessQueue(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN isr)
                     RemoveEntryList(le);
                     bFound = TRUE;
                     element->srb_cnt--;
+                    StorPerfSyncInFlight(StorPerfQueue(adaptExt->Telemetry, index - VIRTIO_SCSI_REQUEST_QUEUE_0),
+                                         element);
+                    StorPerfTargetRemoved(adaptExt->Telemetry, srbExt);
                     break;
                 }
             }
@@ -1577,10 +1760,12 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
                 {
                     PSRB_EXTENSION currSrbExt = CONTAINING_RECORD(entry, SRB_EXTENSION, list_entry);
                     PSCSI_REQUEST_BLOCK currSrb = currSrbExt->Srb;
+                    StorPerfTargetRemoved(adaptExt->Telemetry, currSrbExt);
                     if (currSrb)
                     {
                         SRB_SET_SRB_STATUS(currSrb, SRB_STATUS_BUS_RESET);
                         SRB_SET_DATA_TRANSFER_LENGTH(currSrb, 0);
+                        currSrbExt->SubmitTime = 0; // not a device completion, keep it out of latency stats
                         CompleteRequest(DeviceExtension, (PSRB_TYPE)currSrb);
                         element->srb_cnt--;
                         InterlockedIncrement64(&adaptExt->diagCounters.srbs_completed_on_reset);
@@ -1591,6 +1776,7 @@ VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
             {
                 element->srb_cnt = 0;
             }
+            StorPerfSyncInFlight(StorPerfQueue(adaptExt->Telemetry, index), element);
             VioScsiVQUnlock(DeviceExtension, MsgId, &LockHandle, FALSE);
         }
         StorPortResume(DeviceExtension);
@@ -1667,6 +1853,19 @@ VioScsiProcessPnP(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     return SrbStatus;
 }
 
+// Attributes a device/LUN reset to the target it was addressed to. Bus resets have no target.
+static VOID RecordTargetReset(IN PADAPTER_EXTENSION adaptExt, IN PSRB_TYPE Srb, IN BOOLEAN LogicalUnit)
+{
+    PTARGET_TELEMETRY target = StorPerfTarget(adaptExt->Telemetry, SRB_TARGET_ID(Srb));
+
+    if (target == NULL)
+    {
+        return;
+    }
+    InterlockedIncrement64((PLONG64)(LogicalUnit ? &target->LogicalUnitResetCount : &target->DeviceResetCount));
+    InterlockedExchange64((PLONG64)&target->LastResetTime, (LONG64)StorPerfInterruptTime(adaptExt));
+}
+
 BOOLEAN
 FORCEINLINE
 PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
@@ -1695,13 +1894,70 @@ PreProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                          SRB_TARGET_ID(Srb),
                          SRB_LUN(Srb),
                          Srb);
+
+            if (adaptExt->Telemetry != NULL)
+            {
+                switch (SRB_FUNCTION(Srb))
+                {
+                    case SRB_FUNCTION_RESET_BUS:
+                        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry->BusResetCount);
+                        break;
+                    case SRB_FUNCTION_RESET_DEVICE:
+                        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry->DeviceResetCount);
+                        RecordTargetReset(adaptExt, Srb, FALSE);
+                        break;
+                    case SRB_FUNCTION_RESET_LOGICAL_UNIT:
+                        InterlockedIncrement64((PLONG64)&adaptExt->Telemetry->LogicalUnitResetCount);
+                        RecordTargetReset(adaptExt, Srb, TRUE);
+                        break;
+                }
+                InterlockedExchange64((PLONG64)&adaptExt->Telemetry->LastResetTime,
+                                      (LONG64)StorPerfInterruptTime(adaptExt));
+            }
+
             switch (adaptExt->action_on_reset)
             {
                 case VioscsiResetCompleteRequests:
+                {
+                    LARGE_INTEGER resetStart = {0};
+                    LARGE_INTEGER resetEnd = {0};
+                    LARGE_INTEGER freq = {0};
+                    ULONG qpcStatus;
+                    ULONG qpcEndStatus;
+
                     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Completing all pending SRBs\n");
+                    qpcStatus = StorPortQueryPerformanceCounter(DeviceExtension, &freq, &resetStart);
+                    if (qpcStatus != STOR_STATUS_SUCCESS)
+                    {
+                        RhelDbgPrint(TRACE_LEVEL_ERROR,
+                                     "StorPortQueryPerformanceCounter failed with status 0x%lx, reset duration will not be recorded\n",
+                                     qpcStatus);
+                    }
                     CompletePendingRequestsOnReset(DeviceExtension);
+                    if (qpcStatus == STOR_STATUS_SUCCESS && freq.QuadPart != 0)
+                    {
+                        qpcEndStatus = StorPortQueryPerformanceCounter(DeviceExtension, NULL, &resetEnd);
+                        if (qpcEndStatus == STOR_STATUS_SUCCESS)
+                        {
+                            ULONG64 durationUs =
+                                (ULONG64)(((resetEnd.QuadPart - resetStart.QuadPart) * 1000000) / freq.QuadPart);
+                            if (adaptExt->Telemetry != NULL)
+                            {
+                                adaptExt->Telemetry->LastResetDurationUs = durationUs;
+                                StorPerfUpdateMax(&adaptExt->Telemetry->MaxResetDurationUs, durationUs);
+                            }
+                        }
+                        else
+                        {
+                            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                                         "StorPortQueryPerformanceCounter failed with status 0x%lx, reset duration will not "
+                                         "be recorded\n",
+                                         qpcEndStatus);
+                        }
+                    }
                     SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
                     return TRUE;
+                }
                 case VioscsiResetDoNothing:
                     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Doing nothing with all pending SRBs\n");
                     SRB_SET_SRB_STATUS(Srb, SRB_STATUS_SUCCESS);
@@ -1766,6 +2022,206 @@ VOID PostProcessRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     EXIT_FN_SRB();
 }
 
+// Per-target counterpart of the queue accounting in RecordIoCompletionStats, which calls it once
+// the SRB is known to be an I/O request. The same SubmitTime rule applies: only requests that
+// were actually queued to the device feed latency, slow-request and last-completion state.
+static VOID RecordTargetCompletionStats(IN PADAPTER_EXTENSION adaptExt,
+                                        IN PSRB_TYPE Srb,
+                                        IN PSRB_EXTENSION srbExt,
+                                        IN UCHAR SrbStatus,
+                                        IN ULONGLONG ElapsedUs)
+{
+    PTARGET_TELEMETRY target = StorPerfTarget(adaptExt->Telemetry, srbExt->TargetId);
+    PCDB cdb;
+    ULONG dataLen;
+
+    if (target == NULL)
+    {
+        return;
+    }
+
+    if (srbExt->SubmitTime != 0)
+    {
+        ULONGLONG now = StorPerfInterruptTime(adaptExt);
+
+        InterlockedIncrement64((PLONG64)&target->LatencyCount);
+        InterlockedExchangeAdd64((PLONG64)&target->LatencySumUs, (LONG64)ElapsedUs);
+        if (StorPerfUpdateMax(&target->MaxLatencyUs, ElapsedUs))
+        {
+            InterlockedExchange64((PLONG64)&target->MaxLatencyTime, (LONG64)now);
+        }
+        InterlockedExchange64((PLONG64)&target->LastCompletionTime, (LONG64)now);
+        if (ElapsedUs > STOR_TELEMETRY_SLOW_1S_US)
+        {
+            InterlockedIncrement64((PLONG64)&target->Slow1sCount);
+            if (ElapsedUs > STOR_TELEMETRY_SLOW_5S_US)
+            {
+                InterlockedIncrement64((PLONG64)&target->Slow5sCount);
+                if (ElapsedUs > STOR_TELEMETRY_SLOW_30S_US)
+                {
+                    InterlockedIncrement64((PLONG64)&target->Slow30sCount);
+                }
+            }
+        }
+    }
+
+    switch (SrbStatus)
+    {
+        case SRB_STATUS_BUSY:
+            InterlockedIncrement64((PLONG64)&target->BusyCount);
+            break;
+        case SRB_STATUS_ABORTED:
+        case SRB_STATUS_BUS_RESET:
+            InterlockedIncrement64((PLONG64)&target->AbortedCount);
+            break;
+        case SRB_STATUS_NO_DEVICE:
+            InterlockedIncrement64((PLONG64)&target->NoDeviceCount);
+            break;
+        case SRB_STATUS_INVALID_TARGET_ID:
+            InterlockedIncrement64((PLONG64)&target->InvalidTargetCount);
+            break;
+        case SRB_STATUS_ERROR:
+            InterlockedIncrement64((PLONG64)&target->ErrorCount);
+            break;
+        default:
+            break;
+    }
+
+    dataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
+    cdb = SRB_CDB(Srb);
+    if (!cdb)
+    {
+        InterlockedIncrement64((PLONG64)&target->OtherCount);
+        return;
+    }
+
+    switch (cdb->CDB6GENERIC.OperationCode)
+    {
+        case SCSIOP_READ6:
+        case SCSIOP_READ:
+        case SCSIOP_READ12:
+        case SCSIOP_READ16:
+            InterlockedIncrement64((PLONG64)&target->ReadCount);
+            InterlockedExchangeAdd64((PLONG64)&target->ReadBytes, dataLen);
+            break;
+        case SCSIOP_WRITE6:
+        case SCSIOP_WRITE:
+        case SCSIOP_WRITE12:
+        case SCSIOP_WRITE16:
+        case SCSIOP_WRITE_VERIFY:
+        case SCSIOP_WRITE_VERIFY12:
+        case SCSIOP_WRITE_VERIFY16:
+            InterlockedIncrement64((PLONG64)&target->WriteCount);
+            InterlockedExchangeAdd64((PLONG64)&target->WriteBytes, dataLen);
+            break;
+        default:
+            InterlockedIncrement64((PLONG64)&target->OtherCount);
+            break;
+    }
+}
+
+VOID
+FORCEINLINE
+RecordIoCompletionStats(IN PADAPTER_EXTENSION adaptExt, IN PSRB_TYPE Srb, IN PSRB_EXTENSION srbExt, IN ULONGLONG ElapsedUs)
+{
+    PQUEUE_TELEMETRY queueStats;
+    PCDB cdb;
+    ULONG dataLen;
+    UCHAR maskedStatus;
+    ULONG bucket;
+    ULONGLONG now;
+
+    if (SRB_FUNCTION(Srb) != SRB_FUNCTION_EXECUTE_SCSI || srbExt->QueueIndex >= adaptExt->num_queues)
+    {
+        return;
+    }
+
+    queueStats = StorPerfQueue(adaptExt->Telemetry, srbExt->QueueIndex);
+    if (queueStats == NULL)
+    {
+        return;
+    }
+    dataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
+
+    // Latency, slow-request and last-completion state describe the device, so only requests that
+    // were actually queued to the virtqueue (SubmitTime set by SendSRB) feed them. Completions
+    // made without the device (queue full -> BUSY, bRemoved, reset, surprise removal) would
+    // otherwise refresh LastCompletionTime and hide a real stall. The read/write counters and
+    // status histogram below still count every completion: they record what the initiator was
+    // told, and the BUSY/BUS_RESET/NO_DEVICE slots are useful there.
+    // The latency clock (srbExt->time, stamped in BuildIo) starts earlier than SubmitTime
+    // (stamped after virtqueue_add_buf), so an oldest-in-flight age can be slightly smaller
+    // than the latency of a slow request.
+    if (srbExt->SubmitTime != 0)
+    {
+        bucket = StorPerfLatencyBucket(ElapsedUs);
+        InterlockedIncrement64((PLONG64)&queueStats->Latency.Buckets[bucket]);
+        InterlockedIncrement64((PLONG64)&queueStats->Latency.Count);
+        InterlockedExchangeAdd64((PLONG64)&queueStats->Latency.SumUs, (LONG64)ElapsedUs);
+        StorPerfUpdateMin(&queueStats->Latency.MinUs, ElapsedUs);
+        now = StorPerfInterruptTime(adaptExt);
+        if (StorPerfUpdateMax(&queueStats->Latency.MaxUs, ElapsedUs))
+        {
+            InterlockedExchange64((PLONG64)&queueStats->MaxLatencyTime, (LONG64)now);
+        }
+        InterlockedExchange64((PLONG64)&queueStats->LastCompletionTime, (LONG64)now);
+        if (ElapsedUs > STOR_TELEMETRY_SLOW_1S_US)
+        {
+            InterlockedIncrement64((PLONG64)&queueStats->Slow1sCount);
+            if (ElapsedUs > STOR_TELEMETRY_SLOW_5S_US)
+            {
+                InterlockedIncrement64((PLONG64)&queueStats->Slow5sCount);
+                if (ElapsedUs > STOR_TELEMETRY_SLOW_30S_US)
+                {
+                    InterlockedIncrement64((PLONG64)&queueStats->Slow30sCount);
+                }
+            }
+        }
+    }
+
+    maskedStatus = SrbGetSrbStatus(Srb) & ~(SRB_STATUS_QUEUE_FROZEN | SRB_STATUS_AUTOSENSE_VALID);
+    InterlockedIncrement64((PLONG64)&queueStats->StatusHistogram[StorPerfStatusSlot(maskedStatus)]);
+    RecordTargetCompletionStats(adaptExt, Srb, srbExt, maskedStatus, ElapsedUs);
+
+    cdb = SRB_CDB(Srb);
+    if (!cdb)
+    {
+        InterlockedIncrement64((PLONG64)&queueStats->OtherCount);
+        return;
+    }
+
+    switch (cdb->CDB6GENERIC.OperationCode)
+    {
+        case SCSIOP_READ6:
+        case SCSIOP_READ:
+        case SCSIOP_READ12:
+        case SCSIOP_READ16:
+            InterlockedIncrement64((PLONG64)&queueStats->ReadCount);
+            InterlockedExchangeAdd64((PLONG64)&queueStats->ReadBytes, dataLen);
+            break;
+        case SCSIOP_WRITE6:
+        case SCSIOP_WRITE:
+        case SCSIOP_WRITE12:
+        case SCSIOP_WRITE16:
+        case SCSIOP_WRITE_VERIFY:
+        case SCSIOP_WRITE_VERIFY12:
+        case SCSIOP_WRITE_VERIFY16:
+            InterlockedIncrement64((PLONG64)&queueStats->WriteCount);
+            InterlockedExchangeAdd64((PLONG64)&queueStats->WriteBytes, dataLen);
+            break;
+        case SCSIOP_SYNCHRONIZE_CACHE:
+        case SCSIOP_SYNCHRONIZE_CACHE16:
+            InterlockedIncrement64((PLONG64)&queueStats->FlushCount);
+            break;
+        case SCSIOP_UNMAP:
+            InterlockedIncrement64((PLONG64)&queueStats->UnmapCount);
+            break;
+        default:
+            InterlockedIncrement64((PLONG64)&queueStats->OtherCount);
+            break;
+    }
+}
+
 VOID CompleteRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
 {
     PADAPTER_EXTENSION adaptExt = NULL;
@@ -1775,18 +2231,22 @@ VOID CompleteRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
     PostProcessRequest(DeviceExtension, Srb);
 
-    if (adaptExt->resp_time)
+    srbExt = SRB_EXTENSION(Srb);
+    if (srbExt->time != 0)
     {
-        srbExt = SRB_EXTENSION(Srb);
-        if (srbExt->time != 0)
-        {
-            LARGE_INTEGER counter = {0};
-            LARGE_INTEGER freq = {0};
-            ULONG status = StorPortQueryPerformanceCounter(DeviceExtension, &freq, &counter);
+        LARGE_INTEGER counter = {0};
+        LARGE_INTEGER freq = {0};
+        ULONG status = StorPortQueryPerformanceCounter(DeviceExtension, &freq, &counter);
 
-            if (status == STOR_STATUS_SUCCESS)
+        if (status == STOR_STATUS_SUCCESS)
+        {
+            ULONGLONG elapsed_us = ((counter.QuadPart - srbExt->time) * 1000000) / freq.QuadPart;
+            ULONGLONG time_msec = elapsed_us / 1000;
+
+            RecordIoCompletionStats(adaptExt, Srb, srbExt, elapsed_us);
+
+            if (adaptExt->resp_time)
             {
-                ULONGLONG time_msec = ((counter.QuadPart - srbExt->time) * 1000) / freq.QuadPart;
                 RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                              "time_msec %I64d Start %llu End %llu Freq %llu\n",
                              time_msec,
@@ -1818,13 +2278,13 @@ VOID CompleteRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                     }
                 }
             }
-            else
-            {
-                RhelDbgPrint(TRACE_LEVEL_ERROR,
-                             "SRB 0x%p StorPortQueryPerformanceCounter failed with status  0x%lx\n",
-                             Srb,
-                             status);
-            }
+        }
+        else
+        {
+            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                         "SRB 0x%p StorPortQueryPerformanceCounter failed with status  0x%lx\n",
+                         Srb,
+                         status);
         }
     }
     StorPortNotification(RequestComplete, DeviceExtension, Srb);
@@ -1948,6 +2408,61 @@ VOID VioScsiWmiSrb(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
     }
 
     EXIT_FN_SRB();
+}
+
+// Recomputes every target's OldestInFlightTime from the request lists. A target's requests are
+// spread over all queues and each list is ordered by submission only within its own queue, so the
+// minimum can't be kept up to date on the I/O path without a lock shared by all queues. Instead
+// walk the lists here, one queue at a time under that queue's lock (the same lock the I/O path
+// holds while changing the list, so entries and SubmitTime are stable), and publish the result.
+// The cost is proportional to the number of requests in flight and is only paid when a telemetry
+// read starts (the WMI GetChunk method with Offset 0).
+//
+// The minimums are gathered in a local table (2 KB, which is fine for a kernel stack) and only
+// published at the end, rather than being accumulated in the telemetry table: that would need a
+// reset first, and a reader in between would see 0 ("nothing in flight") for a target that has
+// requests. If two reads run at once each publishes a complete, valid result, so the later one
+// simply wins; TargetScanTime is written last and each value is only ever the age of a real
+// request, so the worst case is a slightly older scan time than the data.
+static VOID TelemetryScanTargets(IN PADAPTER_EXTENSION adaptExt)
+{
+    ULONGLONG oldest[STOR_TELEMETRY_MAX_TARGETS] = {0};
+    ULONG queueCount;
+    ULONG index;
+
+    if (adaptExt->Telemetry == NULL)
+    {
+        return;
+    }
+    queueCount = min((ULONG)adaptExt->num_queues, adaptExt->Telemetry->QueueCapacity);
+
+    for (index = 0; index < queueCount; index++)
+    {
+        PREQUEST_LIST element = &adaptExt->processing_srbs[index];
+        STOR_LOCK_HANDLE lockHandle = {0};
+        ULONG msgId = QUEUE_TO_MESSAGE(index + VIRTIO_SCSI_REQUEST_QUEUE_0);
+        PLIST_ENTRY entry;
+
+        VioScsiVQLock(adaptExt, msgId, &lockHandle, FALSE);
+        for (entry = element->srb_list.Flink; entry != &element->srb_list; entry = entry->Flink)
+        {
+            PSRB_EXTENSION srbExt = CONTAINING_RECORD(entry, SRB_EXTENSION, list_entry);
+
+            if (srbExt->TargetId < STOR_TELEMETRY_MAX_TARGETS && srbExt->SubmitTime != 0 &&
+                (oldest[srbExt->TargetId] == 0 || srbExt->SubmitTime < oldest[srbExt->TargetId]))
+            {
+                oldest[srbExt->TargetId] = srbExt->SubmitTime;
+            }
+        }
+        VioScsiVQUnlock(adaptExt, msgId, &lockHandle, FALSE);
+    }
+
+    for (index = 0; index < STOR_TELEMETRY_MAX_TARGETS; index++)
+    {
+        InterlockedExchange64((PLONG64)&StorPerfTarget(adaptExt->Telemetry, index)->OldestInFlightTime,
+                              (LONG64)oldest[index]);
+    }
+    InterlockedExchange64((PLONG64)&adaptExt->Telemetry->TargetScanTime, (LONG64)StorPerfInterruptTime(adaptExt));
 }
 
 VOID VioScsiIoControl(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb)
@@ -2397,6 +2912,16 @@ VioScsiQueryWmiDataBlock(IN PVOID Context,
                 status = SRB_STATUS_SUCCESS;
             }
             break;
+        case VIOSCSI_TELEMETRY_GUID_INDEX:
+            {
+                // Method-only class: the data block carries nothing beyond the InstanceName/Active
+                // keys the WMI infrastructure itself provides, but WMI still queries it to
+                // enumerate the instances (Get-CimInstance) that GetChunk is then invoked on.
+                size = 0;
+                *InstanceLengthArray = size;
+                status = SRB_STATUS_SUCCESS;
+            }
+            break;
         default:
             {
                 status = SRB_STATUS_ERROR;
@@ -2639,6 +3164,80 @@ VioScsiExecuteWmiMethod(IN PVOID Context,
                     default:
                         status = SRB_STATUS_INVALID_REQUEST;
                         RhelDbgPrint(TRACE_LEVEL_ERROR, " --> ERROR Unknown MethodId = %lu\n", MethodId);
+                        break;
+                }
+            }
+            break;
+        case VIOSCSI_TELEMETRY_GUID_INDEX:
+            {
+                switch (MethodId)
+                {
+                    case VIOSCSI_TELEMETRY_METHOD_GETCHUNK:
+                        {
+                            PVioScsiTelemetryChunk_IN pInBfr = (PVioScsiTelemetryChunk_IN)Buffer;
+                            PVioScsiTelemetryChunk_OUT pOutBfr = (PVioScsiTelemetryChunk_OUT)Buffer;
+                            ULONG totalSize;
+                            ULONG offset;
+                            ULONG length;
+
+                            RhelDbgPrint(TRACE_LEVEL_INFORMATION, " --> VioScsiTelemetry GetChunk\n");
+                            if (adaptExt->Telemetry == NULL)
+                            {
+                                status = SRB_STATUS_ERROR;
+                                break;
+                            }
+                            totalSize = STOR_TELEMETRY_SIZE(adaptExt->Telemetry->QueueCapacity);
+                            if (InBufferSize < VioScsiTelemetryChunk_IN_SIZE)
+                            {
+                                status = SRB_STATUS_ERROR;
+                                break;
+                            }
+                            // The IN and OUT structs share one buffer: TotalSize overlaps Offset and
+                            // ChunkLength overlaps Length, so capture both inputs before writing any
+                            // output.
+                            offset = pInBfr->Offset;
+                            length = (offset >= totalSize) ? 0 : pInBfr->Length;
+                            length = min(length, VIOSCSI_TELEMETRY_MAX_CHUNK);
+                            length = min(length, totalSize - offset);
+
+                            // OutBufferSize must cover everything written, not just the fixed
+                            // header: Data can carry up to VIOSCSI_TELEMETRY_MAX_CHUNK bytes.
+                            size = VioScsiTelemetryChunk_OUT_SIZE(length);
+                            if (OutBufferSize < size)
+                            {
+                                status = SRB_STATUS_DATA_OVERRUN;
+                                break;
+                            }
+
+                            // A read starts at Offset 0: scan the request lists for each target's
+                            // OldestInFlightTime and refresh SnapshotTime there, so a chunked read
+                            // starts from freshly scanned state (and a dump taken during it keeps
+                            // the SnapshotTime semantics).
+                            if (offset == 0)
+                            {
+                                TelemetryScanTargets(adaptExt);
+                                InterlockedExchange64((PLONG64)&adaptExt->Telemetry->SnapshotTime,
+                                                      (LONG64)StorPerfInterruptTime(adaptExt));
+                            }
+
+                            pOutBfr->TotalSize = totalSize;
+                            pOutBfr->ChunkLength = length;
+
+                            // No lock for the counters: they are updated with interlocked
+                            // operations, so a chunked read is not a consistent point-in-time view
+                            // across fields (and on 32-bit builds an individual 64-bit counter can
+                            // tear), which is fine for statistics. QueueCount and the layout only
+                            // change at HwInitialize time (an adapter restart), so the header a
+                            // chunk carries stays valid for the whole read.
+                            if (length != 0)
+                            {
+                                RtlCopyMemory(pOutBfr->Data, (PUCHAR)adaptExt->Telemetry + offset, length);
+                            }
+                        }
+                        break;
+                    default:
+                        status = SRB_STATUS_INVALID_REQUEST;
+                        RhelDbgPrint(TRACE_LEVEL_ERROR, " --> ERROR Unknown Telemetry MethodId = %lu\n", MethodId);
                         break;
                 }
             }
