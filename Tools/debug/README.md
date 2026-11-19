@@ -9,6 +9,7 @@ This directory contains diagnostic tools for Windows guest systems running virti
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics from WinPE/WinRE
 - **GetVioScsiTelemetry.ps1** - vioscsi per-queue and per-target I/O, latency and error counters from a running system
 - **vioscsi_telemetry.js** - WinDbg script showing the same vioscsi counters from a kernel crash dump
+- **GetVioScsiDriverInfo.ps1** - Which vioscsi driver is installed and loaded (file hash, version, driver store, boot time), to confirm a new build is the one running
 
 ---
 
