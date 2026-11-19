@@ -7,6 +7,7 @@ This directory contains diagnostic tools for Windows guest systems running virti
 - **CollectSystemInfo.ps1** - Comprehensive diagnostics bundle (1-5 minutes)
 - **GetVirtioWinInfo.ps1** - Quick version check and reboot status (~5 seconds)
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics from WinPE/WinRE
+- **GetVioScsiTelemetry.ps1** - vioscsi per-queue and per-target I/O, latency and error counters from a running system
 
 ---
 
@@ -236,6 +237,72 @@ Common causes:
 
 - **CollectSystemInfo.ps1** - Full system diagnostics including virtio-win information plus comprehensive system data
 - **CollectSystemInfo-WinPE.ps1** - Offline diagnostics when Windows won't boot
+
+---
+
+# GetVioScsiTelemetry
+
+## Overview
+
+The vioscsi driver keeps cumulative per-queue telemetry: read/write/flush/unmap counts
+and bytes, a log2 latency histogram with min/max/average, a histogram of SRB completion
+statuses, the in-flight high-water mark, the number of times a virtqueue was full, and
+adapter-wide reset counts and durations. This script reads it from every vioscsi adapter
+over WMI — the `root\wmi` class `VioScsiTelemetryGuid`, whose `GetChunk` method hands out
+the driver's live `STOR_TELEMETRY` block in chunks of up to 4096 bytes — and prints a
+summary. The block is a header, a queue table sized for the adapter's maximum number of
+queues (`QueueCapacity`) and a table of 256 targets. It needs a vioscsi driver with telemetry
+version 1, and must be run as Administrator.
+
+For chasing storage timeouts there are per-queue stall indicators: the number of
+requests in flight now, the age of the oldest one, the time since the last completion, the
+time the maximum latency was seen, and counts of requests slower than 1s, 5s and 30s, plus
+the time since the last reset. The latency figures only cover requests that completed, so a
+request that never returns shows up only as a large oldest-in-flight age (the script prints
+a warning for 5s or more). Ages are relative to the moment the read was started (the first
+`GetChunk` call with `Offset=0`, which refreshes `SnapshotTime`).
+
+A target's requests are spread over all queues, so with several targets on one adapter the
+queue tables cannot say which disk has the problem. A per-target section lists each active
+SCSI target (one that has seen any I/O, refusal or reset; `-All` also lists entries without
+activity) with the same stall indicators and latency figures, plus counts of completions
+that ended BUSY, ABORTED/BUS_RESET, NO_DEVICE, other errors or INVALID_TARGET_ID, and
+device and LUN resets addressed to that target. A target with requests in flight whose
+oldest request has been outstanding for 5 seconds or more is marked `STALLED`. Requests
+the driver refuses for a target ID the device doesn't have cannot be attributed to a
+target and are reported once per adapter. The oldest in-flight request per target is
+computed by the driver when a read starts (it would need a lock shared by all queues to
+keep it up to date on the I/O path), so it is exact at the start of this live view; the
+live table holds all 256 target IDs, so the script itself skips the inactive ones.
+
+Counters accumulate from when the adapter was started and cannot be cleared, so compare
+two snapshots to see what changed over an interval. Latency percentiles are upper bounds of
+the histogram bucket they fall in (buckets double in width).
+
+The latency histogram has 40 power-of-two buckets, bucket N covering [2^N, 2^(N+1)) microseconds
+(bucket 0 also holds 0); the last bucket holds everything from 2^39 microseconds (about 6.4 days)
+up. The status histogram has 16 slots per queue. The block lists the SRB status each slot
+counts in its header (`StatusCodes`), SUCCESS, PENDING, ABORTED, ERROR, BUSY and so on, with the
+last slot, shown as `OTHER`, counting every other status.
+
+## Usage
+
+```powershell
+.\GetVioScsiTelemetry.ps1                  # summary of every vioscsi adapter
+.\GetVioScsiTelemetry.ps1 -All             # include queues with no completed requests and idle targets
+.\GetVioScsiTelemetry.ps1 -InstanceName '*PCIID 0001*' # only adapters whose WMI instance name matches
+.\GetVioScsiTelemetry.ps1 -PassThru        # objects (Queues, Targets, raw histograms) for further processing
+.\GetVioScsiTelemetry.ps1 -SaveRaw C:\temp # also save each adapter's raw telemetry blob as a .bin file
+.\GetVioScsiTelemetry.ps1 -InputFile C:\temp\vioscsi-telemetry-_-20261005-101500.bin
+```
+
+Stalled targets can also be picked out of the objects:
+`(.\GetVioScsiTelemetry.ps1 -PassThru)[0].Targets | Where-Object Stalled`.
+
+`-InputFile` parses a saved blob without talking to the driver, so a `.bin`
+collected from a guest can be examined elsewhere (Windows PowerShell 5.1 or PowerShell 7).
+The saved blob is the driver's full live telemetry block; the parser reads the layout from
+its own header.
 
 ---
 
